@@ -51,6 +51,7 @@ __all__ = [
     "SearchEvent",
     "SearchRuntime",
     "StatusEvent",
+    "TagSearch",
     "VSSSearch",
     "models",
 ]
@@ -71,6 +72,7 @@ _LAZY_EXPORTS = {
     "SearchEvent": ".events",
     "SearchRuntime": ".runtime",
     "StatusEvent": ".events",
+    "TagSearch": ".primitives.tag_search",
     "VSSSearch": ".host",
     "models": ".models",
 }
@@ -92,6 +94,7 @@ if TYPE_CHECKING:
     from .primitives.attribute_search import AttributeSearch
     from .primitives.embed_search import EmbedSearch
     from .primitives.search import Search
+    from .primitives.tag_search import TagSearch
     from .runtime import SearchRuntime
 
 
