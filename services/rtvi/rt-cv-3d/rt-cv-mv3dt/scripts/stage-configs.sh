@@ -155,14 +155,18 @@ set_ini sink0 enable "$([ "$OSD" = 1 ] && echo 1 || echo 0)"          # on-scree
 set_ini sink1 enable 1                                                # Kafka metadata sink
 set_ini sink2 enable "$([ "$SAVE_VIDEO" = 1 ] && echo 1 || echo 0)"   # grid file sink (SAVE_VIDEO)
 
-# File input: static file:// [source-list], SEI extraction off, clips play once, and the
-# system clock stamped as NTP so the Kafka/BEV output has per-frame timestamps.
+# File input: static file:// [source-list], SEI extraction off, clips play once,
+# live-source latency dropping disabled, and the system clock stamped as NTP so
+# the Kafka/BEV output has per-frame timestamps.
 if [ "$INPUT_MODE" = "file" ]; then
   set_ini source-list num-source-bins "$NUM_CAMS"
   set_ini source-list list "$URIS"
   set_ini source-list sensor-id-list "$IDS"
   set_ini source-list sensor-name-list "$IDS"
+  set_ini source-list low-latency-mode 0
   set_ini source-list extract-sei-type5-data 0
+  set_ini source-attr-all drop-on-latency 0
+  set_ini source-attr-all latency 100000
   set_ini streammux   extract-sei-sim-time 0
   set_ini streammux   attach-sys-ts-as-ntp 1
   set_ini streammux   live-source 0
