@@ -1825,6 +1825,25 @@ else
   ((TESTS_FAILED++)) || true
 fi
 
+# The root search Compose project does not load rtvi-embed/.env. Pin the
+# profile-to-service message-bus wiring so successful embedding generation
+# cannot leave mdx-embed empty.
+_search_env="${REPO_ROOT}/deploy/docker/developer-profiles/dev-profile-search/.env"
+_rtvi_embed_compose="${REPO_ROOT}/deploy/docker/services/rtvi/rtvi-embed/rtvi-embed-docker-compose.yml"
+if grep -Fxq "RTVI_EMBED_MESSAGE_BUS=kafka" "${_search_env}" && \
+   grep -Fxq "RTVI_EMBED_KAFKA_ENABLED=true" "${_search_env}" && \
+   grep -Fxq "RTVI_EMBED_KAFKA_TOPIC=mdx-embed" "${_search_env}" && \
+   grep -Fq 'MESSAGE_BUS: "${RTVI_EMBED_MESSAGE_BUS:-${MESSAGE_BUS:-}}"' "${_rtvi_embed_compose}" && \
+   grep -Fq 'MESSAGE_BUS_TOPIC: "${RTVI_EMBED_KAFKA_TOPIC:-' "${_rtvi_embed_compose}" && \
+   grep -A3 '^    depends_on:$' "${_rtvi_embed_compose}" | grep -Fq 'broker-health-check:' && \
+   grep -A3 '^      broker-health-check:$' "${_rtvi_embed_compose}" | grep -Fq 'condition: service_completed_successfully'; then
+  echo "PASS: search profile enables RT-Embed publishing after broker readiness"
+  ((TESTS_PASSED++)) || true
+else
+  echo "FAIL: search profile must wire RT-Embed publishing to mdx-embed after broker readiness"
+  ((TESTS_FAILED++)) || true
+fi
+
 # Helm passes bare VST host aliases as well as URL-form endpoints; Docker agent needs the same contract.
 _agent_compose="${REPO_ROOT}/deploy/docker/services/agent/compose.yml"
 if grep -Fq "EXTERNAL_IP:" "${_agent_compose}" && grep -Fq "INTERNAL_IP:" "${_agent_compose}" && grep -Fq "VST_BASE_URL:" "${_agent_compose}"; then

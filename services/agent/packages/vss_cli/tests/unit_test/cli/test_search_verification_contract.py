@@ -46,6 +46,7 @@ def test_search_skill_uses_default_critic_and_unverified_only_fallback() -> None
     main = (SEARCH_SKILL / "SKILL.md").read_text(encoding="utf-8")
     verification = (SEARCH_SKILL / "references/result_verification.md").read_text(encoding="utf-8")
     cli_usage = (SEARCH_SKILL / "references/cli_usage.md").read_text(encoding="utf-8")
+    result_template = (SEARCH_SKILL / "assets/search_result_template.md").read_text(encoding="utf-8")
     normalized_main = " ".join(main.split())
     normalized_verification = " ".join(verification.split())
 
@@ -54,13 +55,24 @@ def test_search_skill_uses_default_critic_and_unverified_only_fallback() -> None
     assert "The CLI attempts critic verification by default" in main
     assert 'VSS_ORIGIN=$("${VSS[@]}" configure show' in main
     assert "Do not repeat public-origin selection" in main
-    assert "Would you like me to verify the unverified search results?" in main
+    assert "Would you like me to verify the unverified search results?" in result_template
+    assert "Use one block per hit" in result_template
+    assert "- Media URL: <complete exact screenshot_url>" in result_template
+    assert "number of `Media URL:` lines" in result_template
+    assert "print each exact `screenshot_url` as `Media URL:`" in main
     assert "only when every displayed result is" in normalized_main
     assert "Never hand off a partially verified result set" in normalized_main
     assert "Verification is fail-open" in cli_usage
     assert "If any hit is `confirmed` or `rejected`, do not delegate any hit" in normalized_verification
     assert "Do not require or add a search-specific mode" in verification
     assert "ordinary user-supplied `VIDEO_URL` interface" in verification
+    assert "Pass exactly two inputs to `vss-ask-video`" in verification
+    assert "Invoke the skill exactly once" in verification
+    assert "An HTTP/auth/media/model failure is technical" in normalized_verification
+    assert "must not contain the term `VLM`" in verification
+    assert "Evidence must describe only visible content" in normalized_verification
+    assert "exactly these four keys" in verification
+    assert "request/retry counts" in verification
     assert "VERIFY_" not in verification
     assert "VERIFY_PIXELS" not in main
 
@@ -123,6 +135,18 @@ def test_ask_video_accepts_only_pre_resolved_confirmed_search_handoff() -> None:
     assert "Treat that URL as Path A; do not rerun search or resolve a different interval" in normalized
     assert "The caller owns verdict validation and any fallback" in normalized
     assert "do not rerun search, resolve a sensor, broaden the clip, or choose another interval" in normalized
+    assert "Do not add a model name, endpoint, VLM/backend label" in normalized
+    assert "For a confirmed search-result handoff requesting JSON, return only that JSON object" in normalized
+    assert "Confirmed search-result single-attempt override" in ask_video
+    assert "Issue exactly one `chat/completions` POST" in normalized
+    assert "Only a 2xx response whose answer is malformed" in normalized
+    assert "VLM_REMOTE_URL" in ask_video and "VLM_REMOTE_MODEL" in ask_video
+    assert "Do not mention a VLM, model, endpoint, API, request, retry, credential, or backend" in normalized
+    bash_blocks = re.findall(r"```bash\n(.*?)```", ask_video, flags=re.DOTALL)
+    chat_post_blocks = [block for block in bash_blocks if "/chat/completions" in block]
+    assert len(chat_post_blocks) == 1
+    assert chat_post_blocks[0].count('-X POST "${VLM_ENDPOINT}/chat/completions"') == 1
+    assert "curl -fsS" in chat_post_blocks[0]
 
 
 def test_search_harbor_eval_exercises_cli_verification_contract() -> None:
@@ -132,6 +156,7 @@ def test_search_harbor_eval_exercises_cli_verification_contract() -> None:
     adapter_module = _load_adapter(SEARCH_ADAPTER, "search_archive_adapter")
     deployment_preamble = adapter_module.DEPLOYMENT_PREAMBLE
     ingestion_preamble = adapter_module.INGESTION_PREAMBLE
+    operation_preamble = adapter_module.OPERATION_PREAMBLE
     deployment_checks = spec["expects"][0]["checks"]
     ingestion_checks = spec["expects"][1]["checks"]
 
@@ -150,6 +175,13 @@ def test_search_harbor_eval_exercises_cli_verification_contract() -> None:
     assert "or prose layout is not required" in adapter
     assert "always use the exact heading `## Video Search Results`" not in adapter
     assert "timeout_sec = 600.0" in adapter
+    assert "Pass only `VIDEO_URL` and `QUESTION`" in adapter_module.VERIFICATION_PREAMBLE
+    assert "without model/vendor names" in adapter_module.VERIFICATION_PREAMBLE
+    assert "Invoke the skill exactly once" in adapter_module.VERIFICATION_PREAMBLE
+    assert "Only a 2xx but malformed JSON" in adapter_module.VERIFICATION_PREAMBLE
+    assert "must not contain the term `VLM`" in adapter_module.VERIFICATION_PREAMBLE
+    assert "A URL checked only inside a command was not reported" in operation_preamble
+    assert "number of visible `Media URL:` lines" in operation_preamble
 
     # Cold deployment and fixture ingestion are separate persisted steps. This
     # prevents model initialization from consuming the ingestion budget and
@@ -161,12 +193,19 @@ def test_search_harbor_eval_exercises_cli_verification_contract() -> None:
     assert "`docker compose up`" in ingestion_preamble
     assert 'VSS=(uv run --project "${VSS_REPO_ROOT}/services/agent" --no-dev --extra cli vss)' in ingestion_preamble
     assert "project-local `vss configure show`" in ingestion_preamble
-    assert any("one bounded source-setup deadline" in check for check in ingestion_checks)
-    assert len(ingestion_checks) == 7
+    assert any("source_setup_budget.sh start 2400" in check for check in ingestion_checks)
+    assert "not a `vss source-setup` subcommand" in ingestion_preamble
+    assert any("RT-Embed" in check and "/v1/models" in check for check in deployment_checks)
+    assert any("RT-Embed" in check and "/v1/models" in check for check in ingestion_checks)
+    assert len(ingestion_checks) == 8
     assert len([check for check in ingestion_checks if check.startswith("The trajectory shows")]) == 2
     assert any("waited until those matching sources were absent" in check for check in ingestion_checks)
     assert any("derived both upload paths from that extraction" in check for check in ingestion_checks)
     assert any("validated each separate `/complete` response" in check for check in ingestion_checks)
+    assert "perform both upload-URL handshakes and both file transfers" in ingestion_preamble
+    assert "before calling either `/complete`" in ingestion_preamble
+    assert "simultaneously contains the exact `warehouse_sample`" in ingestion_preamble
+    assert "start both separate `/complete` requests before waiting for either" in ingestion_preamble
 
     # Current search indices use the VST sensor ID for embed/fusion source
     # scoping and the source name for attribute/object; source_type selects the
@@ -241,24 +280,35 @@ def test_source_lifecycle_uses_current_configure_contract() -> None:
     assert "must not block fixture download, Agent-backed ingestion, or index readiness" in prose
     assert "ONE shared 40-minute source-setup budget, not 40 minutes each" in prose
     assert "Deployment and public-origin selection are prerequisite work outside this ingestion budget" in prose
-    assert "SEARCH_READINESS_DEADLINE:=$(($(date +%s) + 2400))" in lifecycle
-    assert "CURRENT_EPOCH < SEARCH_READINESS_DEADLINE" in lifecycle
+    assert '"${SOURCE_SETUP_BUDGET}" start 2400' in lifecycle
+    assert '"${SOURCE_SETUP_BUDGET}" remaining 900' in lifecycle
+    assert ".services.rt_embed.models[0]" in lifecycle
+    assert '"${RTVI_EMBED_URL%/}/v1/models"' in lifecycle
     assert "is the one sanctioned construction" in prose
     assert "--max-redirs 0" in origin_selector
     assert '.type == "vst"' in origin_selector
     assert origin_selector.count("curl ") == 1
     assert "Do not issue a public-origin `curl` before or after it" in prose
-    assert "readiness_timeout 300" in lifecycle
-    assert "readiness_timeout 900" in lifecycle
+    assert '"${SOURCE_SETUP_BUDGET}" remaining 300' in lifecycle
+    assert '"${SOURCE_SETUP_BUDGET}" remaining 900' in lifecycle
     assert 'max-time "${DELETE_TIMEOUT}"' in lifecycle
     assert 'max-time "${COUNT_TIMEOUT}"' in lifecycle
     assert "DELETE_READINESS_DEADLINE=$(($(date +%s) + 600))" in lifecycle
     assert "delete_timeout()" in lifecycle
     assert 'max-time "${DELETE_TIMEOUT}"' in lifecycle
-    assert 'delete_index_count "${BEHAVIOR_INDEX}" sensor.id.keyword' in lifecycle
-    assert 'delete_index_count "${RAW_INDEX}" sensorId.keyword' in lifecycle
+    cleanup_verifier = (SEARCH_SKILL / "scripts/verify_source_cleanup.sh").read_text(encoding="utf-8")
+    assert 'index_count "${BEHAVIOR_INDEX}" sensor.id.keyword "${SOURCE_NAME}"' in cleanup_verifier
+    assert 'index_count "${RAW_INDEX}" sensorId.keyword "${SOURCE_NAME}"' in cleanup_verifier
     assert "SAMPLE_RTVI_LOG == 1" not in lifecycle
     assert "Never keep an otherwise-ready setup waiting for an exact log message" in prose
+    assert "stage every handshake and file transfer before completing any item" in prose
+    assert "no single VST listing ever contains the whole batch" in prose
+    assert lifecycle.index("WAREHOUSE_LADDER_UPLOAD") < lifecycle.index("complete_upload()")
+    assert "Do not call `/complete` before the required VST registration evidence" in prose
+    assert "Start both completion calls before waiting for either one" in prose
+    assert "the exact VST upload route" in prose
+    assert "literal non-global IP host" in prose
+    assert 'wait "${LADDER_COMPLETE_PID}" || LADDER_COMPLETE_STATUS=$?' in lifecycle
 
     cli_usage = (SEARCH_SKILL / "references/cli_usage.md").read_text(encoding="utf-8")
     assert 'VSS=(uv run --project "${VSS_REPO_ROOT}/services/agent" --no-dev --extra cli vss)' in cli_usage
@@ -316,19 +366,35 @@ printf '%s' "${CURL_STATUS}"
     run_probe(200, '{"type":"vst","version":"3.2.0"}', "https://public.example")
 
 
-def test_readiness_timeout_caps_each_blocking_request() -> None:
-    lifecycle = (SEARCH_SKILL / "references/source_lifecycle.md").read_text(encoding="utf-8")
-    match = re.search(r"(readiness_timeout\(\) \{.*?\n\})", lifecycle, flags=re.DOTALL)
-    assert match is not None
-    script = f"""set -euo pipefail
-{match.group(1)}
-SEARCH_READINESS_DEADLINE=$(($(date +%s) + 3))
-value=$(readiness_timeout 900)
-[ "$value" -ge 1 ] && [ "$value" -le 3 ]
-SEARCH_READINESS_DEADLINE=$(($(date +%s) - 1))
-! readiness_timeout 30
-"""
-    subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
+def test_source_setup_budget_persists_across_shell_calls(tmp_path: Path) -> None:
+    helper = SEARCH_SKILL / "scripts/source_setup_budget.sh"
+    env = {**os.environ, "VSS_CONFIG_HOME": str(tmp_path)}
+    subprocess.run([str(helper), "start", "3"], check=True, env=env)
+    deadline = subprocess.run(
+        [str(helper), "deadline"], check=True, capture_output=True, text=True, env=env
+    ).stdout.strip()
+    value = int(
+        subprocess.run([str(helper), "remaining", "900"], check=True, capture_output=True, text=True, env=env).stdout
+    )
+    assert 1 <= value <= 3
+    assert (
+        subprocess.run([str(helper), "deadline"], check=True, capture_output=True, text=True, env=env).stdout.strip()
+        == deadline
+    )
+
+
+def test_source_setup_budget_rejects_expired_state(tmp_path: Path) -> None:
+    helper = SEARCH_SKILL / "scripts/source_setup_budget.sh"
+    state = tmp_path / "search-source-setup.deadline"
+    state.write_text("1\n", encoding="utf-8")
+    completed = subprocess.run(
+        [str(helper), "remaining", "30"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "VSS_CONFIG_HOME": str(tmp_path)},
+    )
+    assert completed.returncode == 1
+    assert "deadline exhausted" in completed.stderr
 
 
 def test_setup_recipes_cannot_reset_or_bypass_global_deadline() -> None:
@@ -336,13 +402,14 @@ def test_setup_recipes_cannot_reset_or_bypass_global_deadline() -> None:
     source_setup = lifecycle.split("## Pre-ingestion cleanup", 1)[1].split("## Delete source", 1)[0]
     shell = "\n".join(re.findall(r"```bash\n(.*?)```", source_setup, flags=re.DOTALL))
 
-    assert shell.count("SEARCH_READINESS_DEADLINE:=$(($(date +%s) + 2400))") == 1
+    assert shell.count('"${SOURCE_SETUP_BUDGET}" start 2400') == 1
+    assert shell.count("source_setup_budget.sh") >= 2
     assert not re.search(r"(?m)^(?:DEADLINE|READINESS_DEADLINE|CLEANUP_DEADLINE)=", shell)
-    assert re.findall(r"\$\(date \+%s\) \+ (\d+)", shell) == ["2400"]
+    assert not re.findall(r"\$\(date \+%s\) \+ (\d+)", shell)
     assert not re.search(r"--max-time\s+[0-9]+(?:\s|$)", shell)
 
 
-def test_delete_recipe_is_bounded_and_checks_all_cleanup_tuples() -> None:
+def test_delete_recipe_is_bounded_and_checks_all_cleanup_tuples(tmp_path: Path) -> None:
     lifecycle = (SEARCH_SKILL / "references/source_lifecycle.md").read_text(encoding="utf-8")
     blocks = [
         block
@@ -350,15 +417,25 @@ def test_delete_recipe_is_bounded_and_checks_all_cleanup_tuples() -> None:
         if "DELETE_READINESS_DEADLINE=" in block
     ]
     assert len(blocks) == 1
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *'-X DELETE'*) printf '%s\\n' '{"status":"success"}' ;;
+  *'/sensor/list'*) printf '%s\\n' '[]' ;;
+  *'/_count'*) printf '%s\\n' '{"count":0}' ;;
+  *) exit 9 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+
     script = f"""set -euo pipefail
-curl() {{
-  case "$*" in
-    *'-X DELETE'*) printf '%s\n' '{{"status":"success"}}' ;;
-    *'/sensor/list'*) printf '%s\n' '[]' ;;
-    *'/_count'*) printf '%s\n' '{{"count":0}}' ;;
-    *) return 9 ;;
-  esac
-}}
+VSS_REPO_ROOT={REPOSITORY_ROOT}
+VSS_ORIGIN=https://public.example
 AGENT_URL=https://public.example
 VST_URL=https://public.example
 ES_URL=http://elasticsearch:9200
@@ -369,8 +446,82 @@ BEHAVIOR_INDEX=mdx-behavior-2025-01-01
 RAW_INDEX=mdx-raw-2025-01-01
 {blocks[0]}
 """
-    completed = subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
-    assert "delete_status=success vst_present=false counts=0,0,0" in completed.stdout
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    result = json.loads(completed.stdout)
+    assert result == {
+        "vst_present": False,
+        "embedding": {
+            "index": "mdx-embed-filtered-2025-01-01",
+            "field": "sensor.id.keyword",
+            "value": "sensor-1",
+            "count": 0,
+        },
+        "behavior": {
+            "index": "mdx-behavior-2025-01-01",
+            "field": "sensor.id.keyword",
+            "value": "warehouse-ladder",
+            "count": 0,
+        },
+        "raw": {
+            "index": "mdx-raw-2025-01-01",
+            "field": "sensorId.keyword",
+            "value": "warehouse-ladder",
+            "count": 0,
+        },
+    }
+
+    cleanup_verifier = SEARCH_SKILL / "scripts/verify_source_cleanup.sh"
+    assert cleanup_verifier.stat().st_mode & 0o111
+    cleanup_source = cleanup_verifier.read_text(encoding="utf-8")
+    assert blocks[0].count('$("${CLEANUP_VERIFIER}"') == 1
+    assert '"${VSS_ORIGIN}" "${ES_URL}"' in blocks[0]
+    assert 'index_count "${EMBED_INDEX}" sensor.id.keyword "${SENSOR_ID}"' in cleanup_source
+    assert 'index_count "${BEHAVIOR_INDEX}" sensor.id.keyword "${SOURCE_NAME}"' in cleanup_source
+    assert 'index_count "${RAW_INDEX}" sensorId.keyword "${SOURCE_NAME}"' in cleanup_source
+
+
+def test_cleanup_verifier_normalizes_vst_route_base(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *'/vst/vst/'*) exit 9 ;;
+  *'/vst/api/v1/sensor/list'*) printf '%s\n' '[]' ;;
+  *'/_count'*) printf '%s\n' '{"count":0}' ;;
+  *) exit 8 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+
+    completed = subprocess.run(
+        [
+            str(SEARCH_SKILL / "scripts/verify_source_cleanup.sh"),
+            "https://public.example/vst/",
+            "http://elasticsearch:9200",
+            "mdx-embed-filtered-2025-01-01",
+            "mdx-behavior-2025-01-01",
+            "mdx-raw-2025-01-01",
+            "sensor-1",
+            "warehouse-ladder",
+            "5",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert json.loads(completed.stdout)["vst_present"] is False
 
 
 def test_search_adapter_bundles_ask_video_for_confirmation(tmp_path: Path) -> None:

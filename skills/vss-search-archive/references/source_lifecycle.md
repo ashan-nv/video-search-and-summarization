@@ -39,6 +39,9 @@ VSS=(uv run --project "${VSS_REPO_ROOT}/services/agent" --no-dev --extra cli vss
 CONFIG_JSON=$("${VSS[@]}" configure show) || exit 1
 
 ES_URL=$(printf '%s' "${CONFIG_JSON}" | jq -er '.services.elasticsearch.url') || exit 1
+RTVI_EMBED_URL=$(printf '%s' "${CONFIG_JSON}" | jq -er '.services.rt_embed.url') || exit 1
+RTVI_EMBED_MODEL=$(printf '%s' "${CONFIG_JSON}" | jq -er \
+  '.services.rt_embed.models[0] | select(type == "string" and length > 0)') || exit 1
 RTVI_CV_URL=$(printf '%s' "${CONFIG_JSON}" | jq -er '.services.rtvi_cv.url') || exit 1
 RTVI_VLM_URL=$(printf '%s' "${CONFIG_JSON}" | jq -er \
   '.services.rt_vlm.url // empty') || RTVI_VLM_URL=
@@ -59,14 +62,19 @@ resolve_search_indexes() {
 ```
 
 Do not call `resolve_search_indexes` on a fresh stack. Indexes are created
-lazily by ingestion. After every intended upload completes, re-run
-`vss configure --base-url "${VSS_ORIGIN}"`, refresh `CONFIG_JSON`, and call
-`resolve_search_indexes` before readiness checks.
+lazily and may not all appear at the same instant after ingestion. After every
+intended upload completes, boundedly refresh
+`vss configure --base-url "${VSS_ORIGIN}"` under the shared source-setup budget
+until `resolve_search_indexes` observes all three distinct indexes. Only then
+begin document readiness checks.
 Never use `ELASTIC_SEARCH_INDEX`, an index template, or a guessed date in place
 of `vss configure show`.
 
 Before downloading or ingesting media, require bounded Agent and VST health
-through the deployment's host-reachable origin and RTVI-CV readiness. If
+through the deployment's host-reachable origin, a nonempty model from the
+recorded RT-Embed `/v1/models` route, and RTVI-CV readiness. Missing RT-Embed
+is a deployment-readiness failure: stop before cleanup, download, or upload
+instead of waiting for an embedding index that cannot be produced. If
 RT-VLM is recorded, probe its `/v1/models` endpoint; if it is absent, continue
 and let search hits remain `unverified`. A particular eval or deployment
 request may explicitly require RT-VLM and should then stop when that stronger
@@ -141,7 +149,8 @@ index_count() {
   INDEX=$1 FIELD=$2 VALUE=$3
   QUERY=$(jq -cn --arg field "${FIELD}" --arg value "${VALUE}" \
     '{query:{term:{($field):$value}}}') || return 1
-  COUNT_TIMEOUT=$(readiness_timeout 15) || return 1
+  SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+  COUNT_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15) || return 1
   curl -fsS --max-time "${COUNT_TIMEOUT}" -H 'Content-Type: application/json' \
     "${ES_URL}/${INDEX}/_count" -d "${QUERY}" | jq -er '.count | numbers'
 }
@@ -150,37 +159,67 @@ index_count() {
 ## Pre-ingestion cleanup
 
 At the start of one source-setup operation, after deployment, public-origin
-selection, and `vss configure` are complete, initialize the one ingestion
-deadline. Assign `SEARCH_READINESS_DEADLINE` only here; never create
-`DEADLINE`, `READINESS_DEADLINE`, `CLEANUP_DEADLINE`, or another phase timer,
-and never reserve or subtract a fixed number of seconds from it:
+selection, and `vss configure` are complete, initialize the persisted ingestion
+budget exactly once. The helper stores its absolute deadline under the VSS
+configuration directory, so independent Bash tool calls consume the same
+clock. Later calls must use `remaining`; never call `start` again during the
+operation, create a phase timer, or recompute an epoch-plus-duration deadline:
 
 ```bash
-: "${SEARCH_READINESS_DEADLINE:=$(($(date +%s) + 2400))}"
-export SEARCH_READINESS_DEADLINE
-readiness_timeout() {
-  local request_cap=$1 current_epoch remaining
-  current_epoch=$(date +%s)
-  remaining=$((SEARCH_READINESS_DEADLINE - current_epoch))
-  (( remaining > 0 )) || {
-    echo "Search source-setup deadline exhausted" >&2
-    return 1
-  }
-  (( request_cap < remaining )) && printf '%s\n' "${request_cap}" || printf '%s\n' "${remaining}"
-}
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+test -x "${SOURCE_SETUP_BUDGET}" || exit 1
+"${SOURCE_SETUP_BUDGET}" start 2400 || exit 1
 ```
 
 For every subsequent blocking source-mutation or readiness request, obtain its
-`--max-time` from `readiness_timeout <per-request-cap>` immediately before the
-request. A literal `--max-time`, a new epoch-plus-duration expression, or a
-phase-local deadline after this initialization violates the source-setup
-contract.
+`--max-time` from `${SOURCE_SETUP_BUDGET} remaining <per-request-cap>`
+immediately before the request. Re-declare only the helper path when a new Bash
+call begins. A literal `--max-time`, another `start`, a new
+epoch-plus-duration expression, or a phase-local deadline after initialization
+violates the source-setup contract.
+
+Before fixture cleanup, prove that the deployment recorded a working embedding
+model and that RT-CV finished initializing its DeepStream pipeline. These
+read-only probes consume the same source-setup budget. An HTTP 200 alone is not
+RT-CV readiness: require `ds-ready` to be exactly `YES`, accepting the response
+field either at the top level or below `ready-info` for compatibility across
+the supported RT-CV API shapes:
+
+```bash
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+EMBED_MODELS_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 30) || exit 1
+EMBED_MODELS=$(curl -fsS --connect-timeout 5 --max-time "${EMBED_MODELS_TIMEOUT}" \
+  "${RTVI_EMBED_URL%/}/v1/models") || exit 1
+printf '%s' "${EMBED_MODELS}" | jq -e \
+  '.data | type == "array" and length > 0 and
+   all(.[]; .id | type == "string" and length > 0)' >/dev/null || exit 1
+
+while :; do
+  RTVI_CV_READY_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15) || exit 1
+  RTVI_CV_READY=$(curl -fsS --connect-timeout 5 \
+    --max-time "${RTVI_CV_READY_TIMEOUT}" \
+    "${RTVI_CV_URL%/}/api/v1/ready" 2>/dev/null || true)
+  if printf '%s' "${RTVI_CV_READY}" | jq -e \
+    '(."ds-ready" // ."ready-info"."ds-ready" // "") == "YES"' \
+    >/dev/null 2>&1; then
+    break
+  fi
+  "${SOURCE_SETUP_BUDGET}" remaining 10 >/dev/null || exit 1
+  sleep 10
+done
+```
+
+Do not begin cleanup, fixture download, or an Agent upload while this poll is
+still pending. In particular, a listening REST endpoint with `ds-ready: NO`
+can still be building TensorRT engines; adding streams during that phase can
+turn an initialization problem into a persistent CUDNN processing failure.
 
 Cleanup is an Agent operation. Resolve every exact or duplicate fixture entry
 from the VST source list, then delete its UUID only through the Agent:
 
 ```bash
-VST_LIST_TIMEOUT=$(readiness_timeout 15) || exit 1
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+VST_LIST_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15) || exit 1
 VST_SENSOR_LIST=$(curl -fsS --connect-timeout 5 --max-time "${VST_LIST_TIMEOUT}" \
   "${VST_URL%/}/vst/api/v1/sensor/list") || exit 1
 mapfile -t SENSORS_TO_DELETE < <(
@@ -193,14 +232,14 @@ mapfile -t SENSORS_TO_DELETE < <(
 )
 for SENSOR_TO_DELETE in "${SENSORS_TO_DELETE[@]}"; do
   test -n "${SENSOR_TO_DELETE}" || exit 1
-  DELETE_TIMEOUT=$(readiness_timeout 300) || exit 1
+  DELETE_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 300) || exit 1
   curl -fsS --connect-timeout 5 --max-time "${DELETE_TIMEOUT}" -X DELETE \
     "${AGENT_URL%/}/api/v1/videos/${SENSOR_TO_DELETE}" |
     jq -e '.status == "success"' >/dev/null || exit 1
 done
 
 while :; do
-  VST_LIST_TIMEOUT=$(readiness_timeout 15) || exit 1
+  VST_LIST_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15) || exit 1
   VST_SENSOR_LIST=$(curl -fsS --connect-timeout 5 --max-time "${VST_LIST_TIMEOUT}" \
     "${VST_URL%/}/vst/api/v1/sensor/list") || exit 1
   if ! printf '%s' "${VST_SENSOR_LIST}" | jq -e \
@@ -223,7 +262,9 @@ partial state through a backend.
 
 List current sources through `vss-manage-video-io-storage`; do not upload an
 exact existing source. Confirm an interactive upload, then use the mandatory
-three-step agent flow. This flow is mandatory for every file ingestion:
+three-step Agent HTTP flow. This flow is a sequence of HTTP requests sent with
+Bash/curl; it does not imply or require a dedicated Workflow or Agent harness
+tool call. The three mutations are mandatory for every file ingestion:
 
 For the release fixtures, download the exact pinned bundle into a fresh
 directory; never use `find` to substitute a pre-existing warehouse-looking
@@ -243,75 +284,178 @@ test -s "${SAMPLE_DIR}/sample-warehouse-ladder.mp4" || exit 1
 
 ```bash
 : "${AGENT_URL:?resolve the selected search agent}"
-: "${FILE_PATH:?set the local media path}"
-test -r "${FILE_PATH}" || exit 1
-SOURCE_FILENAME=$(basename -- "${FILE_PATH}")
-UPLOAD_FILENAME="${UPLOAD_FILENAME:-${SOURCE_FILENAME}}"
-CANONICAL_SOURCE="${UPLOAD_FILENAME%.*}"
 RTVI_CV_LOG_SINCE="${RTVI_CV_LOG_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
 
-UPLOAD_REQUEST=$(jq -cn --arg filename "${UPLOAD_FILENAME}" '{filename: $filename}')
-UPLOAD_REQUEST_TIMEOUT=$(readiness_timeout 30) || exit 1
-UPLOAD_URL_RESPONSE=$(curl -sfS --max-time "${UPLOAD_REQUEST_TIMEOUT}" -X POST \
-  "${AGENT_URL}/api/v1/videos" \
-  -H "Content-Type: application/json" -d "${UPLOAD_REQUEST}")
-UPLOAD_URL=$(printf '%s' "${UPLOAD_URL_RESPONSE}" |
-  jq -er '.url | select(type == "string" and length > 0)') || exit 1
+stage_agent_upload() {
+  local file_path=$1 upload_filename=$2 request request_timeout
+  local url_response returned_url returned_path effective_url identifier upload_timeout
+  test -r "${file_path}" || return 1
+  request=$(jq -cn --arg filename "${upload_filename}" '{filename: $filename}') || return 1
+  request_timeout=$("${SOURCE_SETUP_BUDGET}" remaining 30) || return 1
+  url_response=$(curl -sfS --max-time "${request_timeout}" -X POST \
+    "${AGENT_URL%/}/api/v1/videos" \
+    -H "Content-Type: application/json" -d "${request}") || return 1
+  returned_url=$(printf '%s' "${url_response}" |
+    jq -er '.url | select(type == "string" and length > 0)') || return 1
 
-IDENTIFIER=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-UPLOAD_TIMEOUT=$(readiness_timeout 300) || exit 1
-UPLOAD_RESPONSE=$(curl -sfS --connect-timeout 10 --max-time "${UPLOAD_TIMEOUT}" -X POST \
-  "${UPLOAD_URL}" \
-  -H "nvstreamer-chunk-number: 1" \
-  -H "nvstreamer-total-chunks: 1" \
-  -H "nvstreamer-is-last-chunk: true" \
-  -H "nvstreamer-identifier: ${IDENTIFIER}" \
-  -H "nvstreamer-file-name: ${UPLOAD_FILENAME}" \
-  -F "mediaFile=@${FILE_PATH};filename=${UPLOAD_FILENAME}" \
-  -F "filename=${UPLOAD_FILENAME}" \
-  -F 'metadata={"timestamp":"2025-01-01T00:00:00"}')
+  case "${returned_url}" in
+    "${VSS_ORIGIN%/}"/*) effective_url=${returned_url} ;;
+    *)
+      # A host-fallback configuration can coexist with the deployment-owned
+      # public URL in the Agent response. Preserve only its validated VST path;
+      # the selector already chose VSS_ORIGIN as the host-reachable authority.
+      returned_path=$(python3 - "${returned_url}" "${VSS_ORIGIN}" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import urlsplit
 
-SENSOR=$(printf '%s' "${UPLOAD_RESPONSE}" |
-  jq -er '.sensorId | select(type == "string" and length > 0)') || exit 1
-COMPLETE_TIMEOUT=$(readiness_timeout 900) || exit 1
-COMPLETE_RESPONSE=$(printf '%s' "${UPLOAD_RESPONSE}" |
-  jq --arg filename "${UPLOAD_FILENAME}" '. + {filename: $filename}' |
-  curl -sfS --connect-timeout 10 --max-time "${COMPLETE_TIMEOUT}" -X POST \
-    "${AGENT_URL}/api/v1/videos/${SENSOR}/complete" \
-    -H "Content-Type: application/json" -d @-)
-printf '%s' "${COMPLETE_RESPONSE}" | jq -e . >/dev/null || exit 1
-printf '%s' "${COMPLETE_RESPONSE}" |
-  jq -e --arg sensor "${SENSOR}" \
-    '.sensor_id == $sensor and
-     (.chunks_processed | type == "number" and . > 0)' >/dev/null ||
-  { echo "Upload completion failed validation" >&2; exit 1; }
+parsed = urlsplit(sys.argv[1])
+configured = urlsplit(sys.argv[2])
+try:
+    configured_ip = ipaddress.ip_address(configured.hostname or "")
+except ValueError:
+    raise SystemExit(1)
+if (
+    parsed.scheme not in {"http", "https"}
+    or not parsed.hostname
+    or parsed.username is not None
+    or parsed.password is not None
+    or parsed.query
+    or parsed.fragment
+    or parsed.path != "/vst/api/v1/storage/file"
+    or configured.scheme not in {"http", "https"}
+    or configured_ip.is_global
+):
+    raise SystemExit(1)
+print(parsed.path)
+PY
+      ) || return 1
+      effective_url="${VSS_ORIGIN%/}${returned_path}"
+      ;;
+  esac
 
-VST_LIST_TIMEOUT=$(readiness_timeout 15) || exit 1
-VST_SENSOR_LIST=$(curl -fsS --connect-timeout 5 --max-time "${VST_LIST_TIMEOUT}" \
-  "${VST_URL%/}/vst/api/v1/sensor/list") || exit 1
-printf '%s' "${VST_SENSOR_LIST}" | jq -e \
-  --arg sensor "${SENSOR}" --arg name "${CANONICAL_SOURCE}" \
-  'any(.[]; .sensorId == $sensor and .name == $name)' >/dev/null || {
-    echo "VST did not register ${CANONICAL_SOURCE} with sensorId ${SENSOR}" >&2
-    exit 1
-  }
+  identifier=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+  upload_timeout=$("${SOURCE_SETUP_BUDGET}" remaining 300) || return 1
+  curl -sfS --connect-timeout 10 --max-time "${upload_timeout}" -X POST \
+    "${effective_url}" \
+    -H "nvstreamer-chunk-number: 1" \
+    -H "nvstreamer-total-chunks: 1" \
+    -H "nvstreamer-is-last-chunk: true" \
+    -H "nvstreamer-identifier: ${identifier}" \
+    -H "nvstreamer-file-name: ${upload_filename}" \
+    -F "mediaFile=@${file_path};filename=${upload_filename}" \
+    -F "filename=${upload_filename}" \
+    -F 'metadata={"timestamp":"2025-01-01T00:00:00"}'
+}
+
+WAREHOUSE_SAMPLE_UPLOAD=$(stage_agent_upload \
+  "${SAMPLE_DIR}/warehouse_sample.mp4" warehouse_sample.mp4) || exit 1
+WAREHOUSE_LADDER_UPLOAD=$(stage_agent_upload \
+  "${SAMPLE_DIR}/sample-warehouse-ladder.mp4" warehouse-ladder.mp4) || exit 1
 ```
+
+Use the returned URL unchanged when it has the configured origin. The only
+permitted authority translation is the branch above: the deployment returned a
+different public authority, `VSS_ORIGIN` has a literal non-global IP host that
+proves it is the selected host-reachable fallback, and the returned path
+validated as the exact VST upload route. A differing authority with a global or
+hostname-based configured origin fails closed. This is not permission to probe
+the rejected public origin again, guess another port, or edit routing.
+
+The final chunk registers the file sensor before Agent post-processing starts.
+For one upload, boundedly prove that VST lists the exact name and returned UUID,
+then call `/complete`. For a batch, **stage every handshake and file transfer
+before completing any item**. File-source playback and downstream processing
+can emit lifecycle events while `/complete` is blocked, so completing the first
+fixture before transferring the second creates a race in which no single VST
+listing ever contains the whole batch.
+
+For the two search fixtures, save the two complete upload-response objects as
+`WAREHOUSE_SAMPLE_UPLOAD` and `WAREHOUSE_LADDER_UPLOAD`, extract their UUIDs,
+and require one bounded VST response to contain both exact name/UUID pairs
+simultaneously. Do not infer this registration from upload responses, index
+documents, logs, or two listings taken at different times:
+
+```bash
+WAREHOUSE_SAMPLE_SENSOR=$(printf '%s' "${WAREHOUSE_SAMPLE_UPLOAD}" |
+  jq -er '.sensorId | select(type == "string" and length > 0)') || exit 1
+WAREHOUSE_LADDER_SENSOR=$(printf '%s' "${WAREHOUSE_LADDER_UPLOAD}" |
+  jq -er '.sensorId | select(type == "string" and length > 0)') || exit 1
+
+while :; do
+  VST_LIST_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15) || exit 1
+  VST_SENSOR_LIST=$(curl -fsS --connect-timeout 5 --max-time "${VST_LIST_TIMEOUT}" \
+    "${VST_URL%/}/vst/api/v1/sensor/list") || exit 1
+  if printf '%s' "${VST_SENSOR_LIST}" | jq -e \
+    --arg sample "${WAREHOUSE_SAMPLE_SENSOR}" \
+    --arg ladder "${WAREHOUSE_LADDER_SENSOR}" '
+      any(.[]; .name == "warehouse_sample" and .sensorId == $sample) and
+      any(.[]; .name == "warehouse-ladder" and .sensorId == $ladder)' \
+      >/dev/null; then
+    break
+  fi
+  "${SOURCE_SETUP_BUDGET}" remaining 2 >/dev/null || exit 1
+  sleep 2
+done
+
+complete_upload() {
+  local sensor=$1 filename=$2 upload_response=$3 response_file=$4 timeout
+  timeout=$("${SOURCE_SETUP_BUDGET}" remaining 900) || return 1
+  printf '%s' "${upload_response}" |
+    jq --arg filename "${filename}" '. + {filename: $filename}' |
+    curl -sfS --connect-timeout 10 --max-time "${timeout}" -X POST \
+      "${AGENT_URL}/api/v1/videos/${sensor}/complete" \
+      -H "Content-Type: application/json" -d @- >"${response_file}"
+}
+COMPLETE_DIR=$(mktemp -d /tmp/vss-search-complete.XXXXXX) || exit 1
+complete_upload "${WAREHOUSE_SAMPLE_SENSOR}" warehouse_sample.mp4 \
+  "${WAREHOUSE_SAMPLE_UPLOAD}" "${COMPLETE_DIR}/sample.json" &
+SAMPLE_COMPLETE_PID=$!
+complete_upload "${WAREHOUSE_LADDER_SENSOR}" warehouse-ladder.mp4 \
+  "${WAREHOUSE_LADDER_UPLOAD}" "${COMPLETE_DIR}/ladder.json" &
+LADDER_COMPLETE_PID=$!
+SAMPLE_COMPLETE_STATUS=0
+LADDER_COMPLETE_STATUS=0
+wait "${SAMPLE_COMPLETE_PID}" || SAMPLE_COMPLETE_STATUS=$?
+wait "${LADDER_COMPLETE_PID}" || LADDER_COMPLETE_STATUS=$?
+(( SAMPLE_COMPLETE_STATUS == 0 && LADDER_COMPLETE_STATUS == 0 )) || exit 1
+jq -e --arg sensor "${WAREHOUSE_SAMPLE_SENSOR}" '
+  .sensor_id == $sensor and
+  (.chunks_processed | type == "number" and . > 0)' \
+  "${COMPLETE_DIR}/sample.json" >/dev/null || exit 1
+jq -e --arg sensor "${WAREHOUSE_LADDER_SENSOR}" '
+  .sensor_id == $sensor and
+  (.chunks_processed | type == "number" and . > 0)' \
+  "${COMPLETE_DIR}/ladder.json" >/dev/null || exit 1
+```
+
+Start both completion calls before waiting for either one. Each request can
+block on media processing, so sequential completion can leave the second staged
+sensor idle for many minutes. Validate the two response files independently;
+one successful response never substitutes for the other.
+
+For a single file, apply the same order with one name/UUID predicate: transfer,
+observe it in VST, then complete it. Do not call `/complete` before the required
+VST registration evidence has been captured.
 
 Never call the deprecated single-step
 `PUT /api/v1/videos-for-search/{filename}`. Use
 `UPLOAD_FILENAME` consistently in every request and multipart field; use that
 same value for the upload request, VST metadata, and completion body.
 Completion alone is not readiness. After completing all intended uploads, run
-one bounded readiness wait (at most 20 minutes) until VST lists the sources and
-the search indexes contain the required documents:
+one bounded readiness wait (at most 20 minutes) until the search indexes contain
+the required documents. Capture the simultaneous VST listing before
+`/complete`, as described above, while the returned UUIDs remain the keys for
+post-completion document checks:
 
 - `EMBED_INDEX`, `sensor.id.keyword`, resolved VST sensor UUID;
 - `BEHAVIOR_INDEX`, `sensor.id.keyword`, canonical source name;
 - `RAW_INDEX`, `sensorId.keyword`, canonical source name.
 
 Embed search requires the first tuple. Fusion requires all three. Agent and
-RTVI-CV logs are bounded diagnostics only: live VST registration plus the
-required embedding, behavior, and raw documents are the readiness contract.
+RTVI-CV logs are bounded diagnostics only: captured live VST registration plus
+the required embedding, behavior, and raw documents are the readiness contract.
 Never keep an otherwise-ready setup waiting for an exact log message.
 
 For the two search fixtures, preserve the upload UUIDs as
@@ -321,9 +465,18 @@ bounded wait:
 ```bash
 : "${WAREHOUSE_SAMPLE_SENSOR:?preserve warehouse_sample upload sensorId}"
 : "${WAREHOUSE_LADDER_SENSOR:?preserve warehouse-ladder upload sensorId}"
-"${VSS[@]}" configure --base-url "${VSS_ORIGIN}" || exit 1
-resolve_search_indexes || exit 1
-: "${SEARCH_READINESS_DEADLINE:?initialize once when source setup begins}"
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+while :; do
+  CONFIGURE_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 30) || break
+  if timeout "${CONFIGURE_TIMEOUT}" "${VSS[@]}" configure \
+       --base-url "${VSS_ORIGIN}" >/dev/null && resolve_search_indexes; then
+    break
+  fi
+  sleep 15
+done
+: "${EMBED_INDEX:?embedding index was not discovered before the deadline}"
+: "${BEHAVIOR_INDEX:?behavior index was not discovered before the deadline}"
+: "${RAW_INDEX:?raw index was not discovered before the deadline}"
 while :; do
   SAMPLE_EMBED_COUNT=$(index_count "${EMBED_INDEX}" sensor.id.keyword \
     "${WAREHOUSE_SAMPLE_SENSOR}" 2>/dev/null || echo 0)
@@ -337,8 +490,7 @@ while :; do
         LADDER_BEHAVIOR_COUNT > 0 && LADDER_RAW_COUNT > 0 )); then
     break
   fi
-  CURRENT_EPOCH=$(date +%s)
-  (( CURRENT_EPOCH < SEARCH_READINESS_DEADLINE )) || break
+  "${SOURCE_SETUP_BUDGET}" remaining 15 >/dev/null || break
   sleep 15
 done
 printf 'indexes=%s,%s,%s sensors=%s,%s counts=%s,%s,%s,%s\n' \
@@ -358,12 +510,14 @@ resolved endpoints, index names, UUIDs, and counts, then collect only bounded
 read-only diagnostics:
 
 ```bash
-DIAGNOSTIC_TIMEOUT=$(readiness_timeout 15) || exit 1
-curl -fsS --connect-timeout 5 --max-time "${DIAGNOSTIC_TIMEOUT}" \
-  "${ES_URL%/}/_cat/indices/mdx-*?format=json" | jq . || true
-for CONTAINER in vss-rtvi-cv vss-behavior-analytics vss-video-analytics-api; do
-  docker logs --since "${RTVI_CV_LOG_SINCE}" --tail 200 "${CONTAINER}" 2>&1 || true
-done
+SOURCE_SETUP_BUDGET="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/source_setup_budget.sh"
+if DIAGNOSTIC_TIMEOUT=$("${SOURCE_SETUP_BUDGET}" remaining 15); then
+  curl -fsS --connect-timeout 5 --max-time "${DIAGNOSTIC_TIMEOUT}" \
+    "${ES_URL%/}/_cat/indices/mdx-*?format=json" | jq . || true
+  for CONTAINER in vss-rtvi-embed vss-rtvi-cv vss-behavior-analytics vss-video-analytics-api; do
+    docker logs --since "${RTVI_CV_LOG_SINCE}" --tail 200 "${CONTAINER}" 2>&1 || true
+  done
+fi
 ```
 
 Then stop with an error. Never post directly to RTVI-CV or Elasticsearch to
@@ -421,52 +575,44 @@ delete_timeout() {
   (( remaining > 0 )) || return 1
   (( request_cap < remaining )) && printf '%s\n' "${request_cap}" || printf '%s\n' "${remaining}"
 }
-delete_index_count() {
-  local index=$1 field=$2 value=$3 timeout query
-  timeout=$(delete_timeout 15) || return 1
-  query=$(jq -cn --arg field "${field}" --arg value "${value}" \
-    '{query:{term:{($field):$value}}}') || return 1
-  curl -fsS --max-time "${timeout}" -H 'Content-Type: application/json' \
-    "${ES_URL%/}/${index}/_count" -d "${query}" | jq -er '.count | numbers'
-}
-
 DELETE_TIMEOUT=$(delete_timeout 60) || exit 1
 DELETE_RESPONSE=$(curl -sfS --max-time "${DELETE_TIMEOUT}" -X DELETE \
   "${AGENT_URL%/}/api/v1/videos/${SAVED_SENSOR_ID}") || exit 1
-printf '%s' "${DELETE_RESPONSE}" | jq -e '.status == "success"' >/dev/null || exit 1
+DELETE_STATUS=$(printf '%s' "${DELETE_RESPONSE}" | \
+  jq -er '.status | select(. == "success" or . == "partial" or . == "failure")') || exit 1
 
-while :; do
-  VST_TIMEOUT=$(delete_timeout 15) || {
-    echo "Timed out waiting for source and index cleanup" >&2
-    exit 1
-  }
-  VST_SENSORS=$(curl -fsS --max-time "${VST_TIMEOUT}" \
-    "${VST_URL%/}/vst/api/v1/sensor/list") || exit 1
-  VST_PRESENT=$(printf '%s' "${VST_SENSORS}" | jq -r \
-    --arg id "${SAVED_SENSOR_ID}" --arg name "${SAVED_SOURCE_NAME}" \
-    'any(.[]; .sensorId == $id or .name == $name)') || exit 1
-  case "${VST_PRESENT}" in true|false) ;; *) exit 1 ;; esac
-  EMBED_COUNT=$(delete_index_count "${EMBED_INDEX}" sensor.id.keyword \
-    "${SAVED_SENSOR_ID}") || exit 1
-  BEHAVIOR_COUNT=$(delete_index_count "${BEHAVIOR_INDEX}" sensor.id.keyword \
-    "${SAVED_SOURCE_NAME}") || exit 1
-  RAW_COUNT=$(delete_index_count "${RAW_INDEX}" sensorId.keyword \
-    "${SAVED_SOURCE_NAME}") || exit 1
-  if [ "${VST_PRESENT}" = false ] &&
-     (( EMBED_COUNT == 0 && BEHAVIOR_COUNT == 0 && RAW_COUNT == 0 )); then
-    break
-  fi
-  sleep 10
-done
-printf 'delete_status=success vst_present=%s counts=%s,%s,%s\n' \
-  "${VST_PRESENT}" "${EMBED_COUNT}" "${BEHAVIOR_COUNT}" "${RAW_COUNT}"
+CLEANUP_VERIFIER="${VSS_REPO_ROOT}/skills/vss-search-archive/scripts/verify_source_cleanup.sh"
+test -x "${CLEANUP_VERIFIER}" || exit 1
+CLEANUP_TIMEOUT=$(delete_timeout 600) || exit 1
+if CLEANUP_RESULT=$("${CLEANUP_VERIFIER}" \
+    "${VSS_ORIGIN}" "${ES_URL}" \
+    "${EMBED_INDEX}" "${BEHAVIOR_INDEX}" "${RAW_INDEX}" \
+    "${SAVED_SENSOR_ID}" "${SAVED_SOURCE_NAME}" "${CLEANUP_TIMEOUT}" 2>&1); then
+  CLEANUP_VERIFIED=true
+else
+  CLEANUP_VERIFIED=false
+fi
+printf '%s\n' "${CLEANUP_RESULT}" | jq .
+[[ ${DELETE_STATUS} == success && ${CLEANUP_VERIFIED} == true ]] || exit 1
 ```
 
-Require response `status` to be `success`; `partial` is not success. Reuse the
-same runtime values and poll until VST no longer lists the source, the embedding
+Always run the read-only bundled verifier after the one Agent DELETE so a
+non-success response cannot suppress cleanup evidence. Still require response
+`status` to be `success`; `partial` is not success. Reuse the same runtime
+values and poll until VST no longer lists the source, the embedding
 tuple for the saved UUID is zero, and behavior/raw tuples for the canonical name
-are zero. Report all counts. Never delete an ambiguous source or issue
-independent backend cleanup. RTSP deletion uses the advertised
+are zero. The bundled verifier emits each exact index, field, value, and count;
+report those values rather than reconstructing alternate queries. Pass
+`VSS_ORIGIN` as the verifier's VST argument; do not append `/vst` or reuse a
+sensor-list route. Invoke the verifier exactly once. If it exits nonzero, report
+its error and stop without rerunning it or issuing substitute VST or
+Elasticsearch queries. Never delete an ambiguous source or issue
+independent backend cleanup. `AGENT_URL` is exactly the selected deployment
+origin (`VSS_ORIGIN`), without an `/api` suffix; the code above appends the one
+canonical route. Issue that DELETE exactly once. Do not probe alternate route
+spellings and do not retry a `partial`, `failure`, or `success` response—a
+second call loses the source-name context needed for exact behavior/raw cleanup
+and cannot repair the first result. RTSP deletion uses the advertised
 `DELETE /api/v1/rtsp-streams/delete/<name>` Agent route and the same bounded
 absence checks; never substitute a direct backend mutation.
 

@@ -85,7 +85,26 @@ For a confirmed search-result handoff, use only the caller-supplied `VIDEO_URL`
 and visual question. Do not consume similarity scores, filenames, object IDs,
 or other retrieval metadata as visual evidence, and do not rerun search,
 resolve a sensor, broaden the clip, or choose another interval. The caller owns
-verdict validation and any fallback after this skill returns.
+verdict validation and any fallback after this skill returns. When that question
+requests a structured JSON contract, return the response text exactly after
+removing hidden reasoning. Do not add a model name, endpoint, VLM/backend label,
+sensor or stream ID, UUID, URL, request/retry count, operational summary, or
+additional JSON fields.
+
+### Confirmed search-result single-attempt override
+
+For that handoff, complete endpoint/model/media-format selection using read-only
+probes before inference, then freeze those choices. Prefer an explicit
+`VLM_ENDPOINT`/`VLM_MODEL`; otherwise, when `VLM_REMOTE_URL` and
+`VLM_REMOTE_MODEL` are both set and its authenticated `/models` probe lists the
+model, use that configured remote endpoint before a proxy. Issue exactly one
+`chat/completions` POST. Do not respond to an HTTP/auth/media/model failure by
+changing endpoint, model, URL, upload format, credentials, or payload and
+posting again; return a technical failure to the caller. Only a 2xx response
+whose answer is malformed against the requested JSON contract permits one
+repair POST, using the same frozen endpoint, model, clip, and upload format.
+Never retry a semantic `confirmed`, `rejected`, or `unverified` result, and stop
+after the repair response whether it succeeds or fails.
 
 ---
 
@@ -265,6 +284,26 @@ base64). A user-supplied `VIDEO_FILE` (Path A) is always inlined — there is no
 
 ## Step 2 — Resolve the VLM endpoint and model
 
+For a confirmed search-result handoff, first adopt a configured direct remote
+endpoint when it is fully specified and its read-only authenticated probe
+succeeds. This selection happens before, and does not count as, the one allowed
+inference request:
+
+```bash
+if [ -z "${VLM_ENDPOINT:-}" ] && [ -n "${VLM_REMOTE_URL:-}" ] && [ -n "${VLM_REMOTE_MODEL:-}" ]; then
+  _remote_endpoint="${VLM_REMOTE_URL%/}"
+  case "${_remote_endpoint}" in */v1) ;; *) _remote_endpoint="${_remote_endpoint}/v1" ;; esac
+  _remote_models=$(curl -fsS --connect-timeout 5 --max-time 15 \
+    -H "Authorization: Bearer ${NVIDIA_API_KEY:?NVIDIA_API_KEY is required for VLM_REMOTE_URL}" \
+    "${_remote_endpoint}/models") || exit 1
+  printf '%s' "${_remote_models}" | jq -e --arg model "${VLM_REMOTE_MODEL}" \
+    '.data | any(.id == $model)' >/dev/null || exit 1
+  VLM_ENDPOINT="${_remote_endpoint}"
+  VLM_MODEL="${VLM_REMOTE_MODEL}"
+  case "${VLM_MODEL}" in *cosmos*) VLM_BACKEND="nim_cosmos" ;; *) VLM_BACKEND="rtvlm" ;; esac
+fi
+```
+
 If the caller already provides a VLM endpoint, use it directly — this skill only requires a
 reachable OpenAI-compatible `chat/completions` endpoint:
 
@@ -374,7 +413,9 @@ is loaded:
 curl -sf --max-time 5 "${VLM_ENDPOINT}/models" | jq -r '.data[].id'
 ```
 
-If the probe fails or the listed ids don't include `${VLM_MODEL}`, fall back to the other backend.
+If the probe fails or the listed ids don't include `${VLM_MODEL}`, fall back to the other backend
+only before any `chat/completions` POST. The confirmed search-result override forbids fallback
+after its first inference request.
 If **no** endpoint resolves at all (nothing reachable), there is no default VLM selection in
 place — follow *No default VLM selection?* below instead of silently failing.
 
@@ -573,10 +614,15 @@ if [ "${VLM_BACKEND}" = "nim_cosmos" ] && { [ "$UPLOAD_FORMAT" = "video_url" ] |
   esac
 fi
 
-# Send THIS body for both formats. Do not write a separate minimal video_url curl — hand-built
+# Send THIS body once for both formats. Do not write a separate minimal video_url curl — hand-built
 # video_url requests keep dropping ${MM_KWARGS}, which under-samples the clip on NIM Cosmos.
-curl -s --connect-timeout 5 --max-time 120 -X POST "${VLM_ENDPOINT}/chat/completions" \
+AUTH_HEADER=()
+if [ -n "${VLM_REMOTE_URL:-}" ] && [[ "${VLM_ENDPOINT%/}" == "${VLM_REMOTE_URL%/}"* ]]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${NVIDIA_API_KEY:?NVIDIA_API_KEY is required for VLM_REMOTE_URL}")
+fi
+curl -fsS --connect-timeout 5 --max-time 120 -X POST "${VLM_ENDPOINT}/chat/completions" \
   -H "Content-Type: application/json" \
+  "${AUTH_HEADER[@]}" \
   -d @- <<EOF | jq -r '.choices[0].message.content'
 {
   "model": $(jq -n --arg m "${VLM_MODEL}" '$m'),
@@ -605,6 +651,11 @@ Return only the VLM's answer text to the user.
   the text after `</think>`.
 - Do not wrap the answer in a report template — this skill returns the plain answer (light
   markdown is fine).
+- For a confirmed search-result handoff requesting JSON, return only that JSON
+  object. Do not wrap, explain, summarize, enrich, or report how it was produced.
+- If that handoff ends in a technical failure, say only that verification of
+  the bounded clip is unavailable due to a technical service failure. Do not
+  mention a VLM, model, endpoint, API, request, retry, credential, or backend.
 
 ---
 

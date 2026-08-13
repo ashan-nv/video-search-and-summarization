@@ -19,10 +19,14 @@ Covers the RTVI-CV cleanup helper used by ``DELETE /api/v1/videos/{video_id}``.
 
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 
+from vss_agents.api.video_delete import EsCleanupConfig
 from vss_agents.api.video_delete import _remove_from_rtvi_cv
+from vss_agents.api.video_delete import create_video_delete_router
+from vss_agents.tools.vst.utils import VSTError
 
 
 class TestRemoveFromRtviCv:
@@ -80,6 +84,79 @@ class TestRemoveFromRtviCv:
         assert success is False
         assert "500" in msg
 
+    @pytest.mark.parametrize(
+        ("status_code", "body"),
+        [
+            (404, "Stream not found"),
+            (410, "stream is already removed"),
+            (400, "Stream not found"),
+            (409, "stream already removed"),
+            (500, "requested stream does not exist"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_already_absent_remove_is_idempotent_success(self, status_code, body):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.text = body
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        success, msg = await _remove_from_rtvi_cv(
+            mock_client,
+            "http://rtvi-cv:9000",
+            "sensor-123",
+            "camera-1",
+        )
+
+        assert success is True
+        assert msg == "already absent"
+
+    @pytest.mark.asyncio
+    async def test_non_absence_client_error_reports_failure(self):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.text = "invalid camera payload"
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        success, msg = await _remove_from_rtvi_cv(
+            mock_client,
+            "http://rtvi-cv:9000",
+            "sensor-123",
+            "camera-1",
+        )
+
+        assert success is False
+        assert "400" in msg
+
+    @pytest.mark.parametrize(
+        ("status_code", "body"),
+        [
+            (404, "Not Found"),
+            (410, "route gone"),
+            (409, "configuration conflict"),
+            (500, "model file not found while removing stream"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_stream_absence_response_reports_failure(self, status_code, body):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.text = body
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        success, msg = await _remove_from_rtvi_cv(
+            mock_client,
+            "http://rtvi-cv:9000",
+            "sensor-123",
+            "camera-1",
+        )
+
+        assert success is False
+        assert str(status_code) in msg
+
     @pytest.mark.asyncio
     async def test_network_error_reports_failure(self):
         mock_client = MagicMock()
@@ -89,3 +166,137 @@ class TestRemoveFromRtviCv:
 
         assert success is False
         assert "boom" in msg
+
+
+class TestDeleteVideoAggregateStatus:
+    @pytest.mark.asyncio
+    @patch("vss_agents.api.video_delete.verify_vst_cleanup", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_sensor", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_storage", new_callable=AsyncMock)
+    async def test_final_vst_postcondition_recovers_false_negative(
+        self,
+        mock_delete_storage,
+        mock_delete_sensor,
+        mock_verify_vst_cleanup,
+    ):
+        mock_delete_storage.return_value = (False, "storage returned 500")
+        mock_delete_sensor.return_value = (True, "OK")
+        mock_verify_vst_cleanup.return_value = (True, "source and storage absent")
+        router = create_video_delete_router(vst_internal_url="http://vst:30888")
+
+        response = await router.routes[0].endpoint("sensor-123")
+
+        assert response.status == "success"
+        mock_delete_storage.assert_awaited_once()
+        mock_delete_sensor.assert_awaited_once()
+        mock_verify_vst_cleanup.assert_awaited_once_with("http://vst:30888", "sensor-123")
+
+    @pytest.mark.asyncio
+    @patch("vss_agents.api.video_delete.verify_vst_cleanup", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_sensor", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_storage", new_callable=AsyncMock)
+    async def test_final_vst_postcondition_remains_fail_closed(
+        self,
+        mock_delete_storage,
+        mock_delete_sensor,
+        mock_verify_vst_cleanup,
+    ):
+        mock_delete_storage.return_value = (False, "route not found")
+        mock_delete_sensor.return_value = (True, "OK")
+        mock_verify_vst_cleanup.return_value = (False, "storage_absent=False")
+        router = create_video_delete_router(vst_internal_url="http://vst:30888")
+
+        response = await router.routes[0].endpoint("sensor-123")
+
+        assert response.status == "failure"
+
+    @pytest.mark.asyncio
+    @patch("vss_agents.api.video_delete.delete_vst_sensor", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_storage", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._remove_from_rtvi_cv", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._delete_es_documents", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.get_sensor_id_from_stream_id", new_callable=AsyncMock)
+    async def test_optional_rtvi_failure_does_not_downgrade_durable_cleanup(
+        self,
+        mock_get_sensor_name,
+        mock_delete_es,
+        mock_remove_rtvi,
+        mock_delete_storage,
+        mock_delete_sensor,
+    ):
+        mock_get_sensor_name.return_value = "warehouse-ladder"
+        mock_delete_es.return_value = (True, "Deleted")
+        mock_remove_rtvi.return_value = (False, "RTVI-CV returned 500")
+        mock_delete_storage.return_value = (True, "OK")
+        mock_delete_sensor.return_value = (True, "OK")
+        router = create_video_delete_router(
+            vst_internal_url="http://vst:30888",
+            rtvi_cv_base_url="http://rtvi-cv:9000",
+            es_config=EsCleanupConfig(url="http://elasticsearch:9200"),
+        )
+
+        response = await router.routes[0].endpoint("sensor-123")
+
+        assert response.status == "success"
+        mock_remove_rtvi.assert_awaited_once()
+        assert mock_delete_es.await_count == 3
+
+    @pytest.mark.asyncio
+    @patch("vss_agents.api.video_delete.delete_vst_sensor", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_storage", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._remove_from_rtvi_cv", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._delete_es_documents", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.get_sensor_id_from_stream_id", new_callable=AsyncMock)
+    async def test_already_absent_rtvi_stream_yields_success(
+        self,
+        mock_get_sensor_name,
+        mock_delete_es,
+        mock_remove_rtvi,
+        mock_delete_storage,
+        mock_delete_sensor,
+    ):
+        mock_get_sensor_name.return_value = "warehouse-ladder"
+        mock_delete_es.return_value = (True, "Deleted")
+        mock_remove_rtvi.return_value = (True, "already absent")
+        mock_delete_storage.return_value = (True, "OK")
+        mock_delete_sensor.return_value = (True, "already absent")
+        router = create_video_delete_router(
+            vst_internal_url="http://vst:30888",
+            rtvi_cv_base_url="http://rtvi-cv:9000",
+            es_config=EsCleanupConfig(url="http://elasticsearch:9200"),
+        )
+
+        response = await router.routes[0].endpoint("sensor-123")
+
+        assert response.status == "success"
+        assert mock_delete_es.await_count == 3
+
+    @pytest.mark.asyncio
+    @patch("vss_agents.api.video_delete.delete_vst_sensor", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.delete_vst_storage", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._remove_from_rtvi_cv", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete._delete_es_documents", new_callable=AsyncMock)
+    @patch("vss_agents.api.video_delete.get_sensor_id_from_stream_id", new_callable=AsyncMock)
+    async def test_missing_sensor_name_cannot_report_success(
+        self,
+        mock_get_sensor_name,
+        mock_delete_es,
+        mock_remove_rtvi,
+        mock_delete_storage,
+        mock_delete_sensor,
+    ):
+        mock_get_sensor_name.side_effect = VSTError("stream not found")
+        mock_delete_es.return_value = (True, "Deleted")
+        mock_remove_rtvi.return_value = (True, "already absent")
+        mock_delete_storage.return_value = (True, "OK")
+        mock_delete_sensor.return_value = (True, "already absent")
+        router = create_video_delete_router(
+            vst_internal_url="http://vst:30888",
+            rtvi_cv_base_url="http://rtvi-cv:9000",
+            es_config=EsCleanupConfig(url="http://elasticsearch:9200"),
+        )
+
+        response = await router.routes[0].endpoint("sensor-123")
+
+        assert response.status == "partial"
+        mock_delete_es.assert_awaited_once()
