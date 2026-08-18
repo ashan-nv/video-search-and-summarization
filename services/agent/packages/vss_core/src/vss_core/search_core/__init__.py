@@ -54,6 +54,7 @@ __all__ = [
     "TagIngestor",
     "TagSearch",
     "VSSSearch",
+    "fuse_ranked_union",
     "models",
 ]
 
@@ -64,6 +65,7 @@ _LAZY_EXPORTS = {
     "EmbedSearch": ".primitives.embed_search",
     "ErrorEvent": ".events",
     "FinalResultEvent": ".events",
+    "fuse_ranked_union": ".primitives._fusion",
     "IndexNotFoundError": ".errors",
     "InvalidInputError": ".errors",
     "NoFinalResultError": ".errors",
@@ -93,6 +95,7 @@ if TYPE_CHECKING:
     from .events import SearchEvent
     from .events import StatusEvent
     from .host import VSSSearch
+    from .primitives._fusion import fuse_ranked_union
     from .primitives.attribute_search import AttributeSearch
     from .primitives.embed_search import EmbedSearch
     from .primitives.search import Search
