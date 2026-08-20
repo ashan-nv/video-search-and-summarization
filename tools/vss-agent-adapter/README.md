@@ -21,6 +21,7 @@ notes are in **[DECISIONS.md](DECISIONS.md)** — read that before changing anyt
 | `GET` | `/v1/skills/<name>/bundle.tar.gz` | one skill incl. `scripts/` and `references/` |
 | `GET` | `/v1/skills/bundle.tar.gz` | all skills, version-matched to this deployment |
 | `GET` | `/v1/skills/env` | resolved VSS base URLs (replaces `HOST_IP` guessing) |
+| `POST` | `/v1/search` | archive search over HTTP (runs the host `vss` CLI) |
 
 The request/response shape is not invented — it is what the VSS UI already speaks
 (`packages/nemo-agent-toolkit-ui/pages/api/chat.ts`). Any backend implementing
@@ -45,6 +46,20 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 | `VSS_HOST_ALIAS` | `host.openshell.internal` | advertised by `/v1/skills/env` |
 | `ADAPTER_BOOTSTRAP` | `1` | set `0` to disable first-turn context injection |
 | `ADAPTER_PUBLIC_URL` | `http://<alias>:<port>` | base URL the agent is told to fetch from |
+| `VSS_REPO_ROOT` | `~/video-search-and-summarization` | checkout used by `/v1/search` |
+| `UV_BIN` | auto-detected | `uv` used to run the CLI |
+| `ADAPTER_SEARCH_TIMEOUT` | `180` | seconds |
+
+## Archive search
+
+`POST /v1/search` with
+`{"mode":"embed","query":"...","top_k":10,"source_type":"video_file"}`.
+
+`vss-search-archive` needs `uv` and a source checkout, which a sandboxed or hosted agent
+does not have. This runs the same CLI host-side and returns the same `SearchOutput`.
+
+Requires `vss configure --base-url <origin>` once on the host, and **the adapter port must
+be listed in `assets/vss_nemoclaw_policy.yaml`** or sandbox calls fail as `policy_denied`.
 
 ## Bootstrap
 

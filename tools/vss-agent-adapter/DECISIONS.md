@@ -200,6 +200,31 @@ Detection is text-based, so it is a hint rather than a contract — some mention
 fallbacks or prohibitions ("do not run docker directly"). Still far better than a uniform
 claim. A future `requirements:` block in SKILL.md frontmatter would make it exact.
 
+### 2.8d Archive search over HTTP
+
+**Decided:** the adapter exposes `POST /v1/search`, which runs the same host CLI
+(`vss search run <mode> --raw`) the skill would and returns its `SearchOutput`.
+
+`vss-search-archive` needs `uv` plus a VSS source checkout (2.8c). A sandboxed agent has
+neither, and a hosted BYO agent never will — so the skill was simply unrunnable. Rather
+than installing a toolchain and a source tree into every agent environment, run it once
+on the host and expose HTTP, which is the one thing every agent can reach.
+
+Body: `{mode: embed|attribute|fusion|object, query, top_k, source_type, video_sources}`.
+Arguments are built as a list and passed without a shell, and every value is validated or
+coerced, so a request body cannot inject flags or commands.
+
+**The egress policy must list the adapter's port.** Verified the hard way: with 9098
+absent from `vss_nemoclaw_policy.yaml`, the agent's call was denied before leaving the
+sandbox and it reported the deployment unreachable — a plausible but wrong diagnosis.
+Adding port 9098 and re-running `policy-add` (version 5) fixed it.
+
+Verified end to end: UI -> adapter -> gateway -> agent -> HTTP -> adapter -> uv -> CLI ->
+Elasticsearch. The agent's request reaches `/v1/search` and it reports the true blocker
+(`Search index 'mdx-embed-filtered-*' does not exist. Please ensure videos have been
+ingested`). **Not yet verified against real results** — nothing has been ingested on this
+deployment, so the happy path with actual hits is untested.
+
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
 **Decided:** support Case A. Defer Case B.

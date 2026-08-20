@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import io, json, os, queue, re, tarfile, threading, uuid
+import io, json, os, queue, re, shutil, subprocess, tarfile, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -35,6 +35,19 @@ HOST_ALIAS = os.environ.get("VSS_HOST_ALIAS", "host.openshell.internal")
 BOOTSTRAP_ENABLED = os.environ.get("ADAPTER_BOOTSTRAP", "1") != "0"
 ADAPTER_PUBLIC_URL = os.environ.get(
     "ADAPTER_PUBLIC_URL", f"http://{HOST_ALIAS}:{os.environ.get('ADAPTER_PORT', '9099')}")
+
+# Archive search over HTTP.
+#
+# `vss-search-archive` drives a host CLI (`vss search run` via uv) against a
+# source checkout. A sandboxed or hosted agent has neither, so the skill is
+# unrunnable there -- see DECISIONS.md 2.8c. This endpoint runs the same CLI on
+# the host and exposes it as plain HTTP, which is the one thing every agent can
+# reach.
+VSS_REPO_ROOT = os.environ.get(
+    "VSS_REPO_ROOT", os.path.expanduser("~/video-search-and-summarization"))
+UV_BIN = os.environ.get("UV_BIN") or shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
+SEARCH_MODES = ("embed", "attribute", "fusion", "object")
+SEARCH_TIMEOUT = int(os.environ.get("ADAPTER_SEARCH_TIMEOUT", "180"))
 
 SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
 _HOLD = max(len(x) for x in SENTINELS) - 1
@@ -169,6 +182,14 @@ def build_bootstrap(manifest, base_url):
             f"{e.get('description') or '(no description)'}")
     lines += [
         "",
+        "## Archive search over HTTP",
+        f"POST {base_url}/v1/search  ->  SearchOutput (a `data` array of hits).",
+        'Body: {\"mode\": \"embed\"|\"attribute\"|\"fusion\"|\"object\",',
+        '       \"query\": \"...\", \"top_k\": 10,',
+        '       \"source_type\": \"video_file\"|\"rtsp\", \"video_sources\": [..]}',
+        "Use this instead of the `vss` CLI when uv or a repo checkout is absent;",
+        "it runs the same command host-side. Present hits as prose, not raw JSON.",
+        "",
         "## Conventions",
         "- Each skill lists what it needs. Before using one, verify those tools",
         "  exist (`command -v <tool>`). If something is missing, say exactly which",
@@ -220,6 +241,62 @@ class SentinelFilter:
 
 def sse(data: str) -> bytes:
     return f"data: {data}\n\n".encode()
+
+
+def run_search(body):
+    """Invoke `vss search run <mode> --raw` and return its SearchOutput.
+
+    Args are built as a list and passed without a shell, and every value is
+    validated or coerced, so a request body cannot inject flags or commands.
+    """
+    mode = body.get("mode", "embed")
+    if mode not in SEARCH_MODES:
+        return 400, {"error": f"mode must be one of {list(SEARCH_MODES)}"}
+    if not os.path.isdir(VSS_REPO_ROOT):
+        return 503, {"error": f"VSS_REPO_ROOT not found: {VSS_REPO_ROOT}"}
+    if not os.path.exists(UV_BIN):
+        return 503, {"error": "uv not found on the host; set UV_BIN"}
+
+    cmd = [UV_BIN, "run", "--project", os.path.join(VSS_REPO_ROOT, "services", "agent"),
+           "--no-dev", "--extra", "cli", "vss", "search", "run", mode, "--raw"]
+
+    query = body.get("query")
+    if query:
+        cmd += ["--query", str(query)]
+    try:
+        top_k = int(body.get("top_k", 10))
+    except (TypeError, ValueError):
+        return 400, {"error": "top_k must be an integer"}
+    cmd += ["--top-k", str(max(1, min(top_k, 1000)))]
+    if body.get("source_type") in ("video_file", "rtsp"):
+        cmd += ["--source-type", body["source_type"]]
+    for src in body.get("video_sources") or []:
+        cmd += ["--video-source", str(src)]
+    for key, flag in (("timestamp_start", "--timestamp-start"),
+                      ("timestamp_end", "--timestamp-end"),
+                      ("object_id", "--object-id")):
+        if body.get(key):
+            cmd += [flag, str(body[key])]
+
+    try:
+        proc = subprocess.run(cmd, cwd=VSS_REPO_ROOT, capture_output=True,
+                              text=True, timeout=SEARCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 504, {"error": f"search timed out after {SEARCH_TIMEOUT}s"}
+    if proc.returncode != 0:
+        return 502, {"error": "search command failed",
+                     "exit_code": proc.returncode,
+                     "stderr": (proc.stderr or "")[-800:]}
+    # The CLI prefixes log lines; SearchOutput is the last JSON object printed.
+    out = (proc.stdout or "").strip()
+    start = out.find("{")
+    if start == -1:
+        return 502, {"error": "no JSON in search output", "stdout": out[-500:]}
+    try:
+        return 200, json.loads(out[start:])
+    except json.JSONDecodeError as exc:
+        return 502, {"error": f"unparseable search output: {exc}",
+                     "stdout": out[-500:]}
 
 
 BOOTSTRAPPED = set()
@@ -390,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                     "elasticsearch": f"http://{HOST_ALIAS}:9200",
                     "vst_vios": f"http://{HOST_ALIAS}:30888",
                     "rt_vlm": f"http://{HOST_ALIAS}:8018",
+                    "archive_search": f"{ADAPTER_PUBLIC_URL}/v1/search",
                 },
             })
             return
@@ -443,7 +521,8 @@ class Handler(BaseHTTPRequestHandler):
                     "skills": len(self._skills_manifest())})
 
     def do_POST(self):
-        if self.path.split("?")[0].rstrip("/") not in ("/chat/stream", "/generate/stream"):
+        path = self.path.split("?")[0].rstrip("/")
+        if path not in ("/chat/stream", "/generate/stream", "/v1/search"):
             self.send_error(404)
             return
         raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
@@ -451,6 +530,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             self.send_error(400, "invalid JSON")
+            return
+
+        if path == "/v1/search":
+            code, payload = run_search(body)
+            self._json(payload, code)
             return
 
         msgs = body.get("messages") or []
