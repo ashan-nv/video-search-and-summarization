@@ -248,10 +248,19 @@ This is a VSS retrieval issue, not an adapter one: `/v1/search` faithfully retur
 whatever the CLI produces. Worth noting that the empty `search_messages` makes this
 silent — a caller cannot distinguish "no matches" from "retrieval is misconfigured".
 
-**Also found:** `vss-agent` hands out upload URLs built from a stale
+**Also found and fixed:** `vss-agent` was handing out upload URLs built from a stale
 `VSS_AGENT_EXTERNAL_URL` pointing at a dead cloudflare hostname, so the documented
-ingestion flow fails at step 2 unless the origin is substituted. Same quick-tunnel
-instability noted for the dashboard.
+ingestion flow failed at step 2. Root cause was **not** a bad config value —
+`resolved.yml` already held the current hostname; the *running container* predated the
+regeneration and was still carrying the old env. Recreating `vss-agent` picked up the
+current config. Worth remembering that `resolved.yml` being correct says nothing about
+what a long-running container actually has.
+
+Consequence to know about: the corrected URL points at the public tunnel origin, which
+is behind HTTP basic auth. Browsers authenticate once and cache; **programmatic callers
+(agents, skills, scripts) must either send credentials or use the internal origin**
+(`http://localhost:7777`). Exempting the upload path from auth would let anyone upload
+video to the deployment, so the auth stays and callers adapt.
 
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
