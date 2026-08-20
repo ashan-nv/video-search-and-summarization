@@ -2,7 +2,7 @@
 
 **Status:** POC wired and working end to end.
 **Date:** 2026-08-19
-**Host:** `brev-tg9bx7dq6` (Brev/OCI us-chicago-1, 4× L40S, public IP 149.130.215.222)
+**Reference environment:** Brev/OCI instance, 4x L40S, VSS `search` profile.
 
 ---
 
@@ -290,7 +290,7 @@ default and the SSE path is used.
 | Harness | OpenClaw 2026.6.10 |
 | Model | `nvidia/nemotron-3-super-120b-a12b` (build.nvidia.com) |
 | Install ref | `v0.0.80` |
-| Dashboard | `https://lotus-dui-interval-will.trycloudflare.com/#token=<gateway-token>` |
+| Dashboard | `https://<your-tunnel-or-host>:18789/#token=<gateway-token>` |
 | Policy | v4, `vss` preset over installer's balanced tier |
 | Skills | 18 installed |
 | Hooks | enabled; token in `~/.nemoclaw_hooks_token` |
