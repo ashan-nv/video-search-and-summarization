@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import io, json, os, queue, tarfile, threading, uuid
+import io, json, os, queue, re, tarfile, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -38,6 +38,35 @@ ADAPTER_PUBLIC_URL = os.environ.get(
 
 SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
 _HOLD = max(len(x) for x in SENTINELS) - 1
+
+
+# What a skill's SKILL.md has to mention for us to claim it needs that tool.
+# Audited against the 18 VSS skills: 17 reference docker, 5 need uv, 3 need a
+# repo checkout. A sandboxed agent typically has curl/jq/python3 but NOT docker
+# or uv, so advertising a uniform requirement set is actively misleading.
+_REQUIREMENT_PATTERNS = [
+    ("uv", re.compile(r"(?:^|[^a-z])uv (?:run|tool)|uvx ", re.M)),
+    ("vss-repo", re.compile(r"VSS_REPO_ROOT|services/agent")),
+    ("docker", re.compile(r"(?:^|[^a-z-])docker ")),
+    ("curl", re.compile(r"\bcurl\b")),
+    ("jq", re.compile(r"\bjq\b")),
+    ("mcp", re.compile(r"mcp", re.I)),
+]
+
+
+def _detect_requirements(skill_md):
+    """Best-effort: what a skill's instructions actually reach for.
+
+    Derived from the text, so it is a hint rather than a contract -- some
+    mentions are fallbacks or prohibitions ("do not run docker directly").
+    Still far better than claiming every skill needs the same three things.
+    """
+    try:
+        with open(skill_md, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return []
+    return [name for name, pat in _REQUIREMENT_PATTERNS if pat.search(body)]
 
 
 def _frontmatter_description(skill_md):
@@ -84,9 +113,8 @@ def skills_manifest():
                 "path": os.path.relpath(root, SKILLS_DIR),
                 "description": _frontmatter_description(
                     os.path.join(root, "SKILL.md")),
-                # Skills are curl recipes: they need a shell and network egress
-                # to the VSS backends. A harness without those cannot run them.
-                "requirements": ["shell", "curl", "network"],
+                "requirements": _detect_requirements(
+                    os.path.join(root, "SKILL.md")),
             })
             dirs[:] = []
     return sorted(entries, key=lambda e: e["name"])
@@ -132,12 +160,24 @@ def build_bootstrap(manifest, base_url):
         "",
     ]
     for e in manifest:
-        lines.append(f"- {e['name']}: {e.get('description') or '(no description)'}")
+        # Requirements go next to the name, not in a footnote: the agent picks a
+        # skill from this list, so it has to see the cost at selection time.
+        # Without this it refuses for plausible-but-wrong reasons.
+        needs = ", ".join(e.get("requirements") or []) or "none"
+        lines.append(
+            f"- {e['name']} [needs: {needs}]: "
+            f"{e.get('description') or '(no description)'}")
     lines += [
         "",
         "## Conventions",
+        "- Each skill lists what it needs. Before using one, verify those tools",
+        "  exist (`command -v <tool>`). If something is missing, say exactly which",
+        "  tool is absent -- do not blame an unrelated service.",
+        "- `vss-repo` means the skill needs a VSS source checkout and its CLI; that",
+        "  is usually absent in a sandbox, and no amount of network access fixes it.",
         "- Deployment/teardown goes through the VSS Orchestrator MCP, never raw",
-        "  `docker compose` or host shell commands.",
+        "  `docker compose` or host shell commands. That MCP runs on the host, so",
+        "  you do not need local docker to deploy.",
         "- Report progress in chat as you go; do not go silent during long tasks.",
         "- Never invent a host:port URL for the user; read the deployed public",
         "  origin from the deployment rather than constructing one.",

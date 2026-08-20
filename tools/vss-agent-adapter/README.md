@@ -16,7 +16,7 @@ notes are in **[DECISIONS.md](DECISIONS.md)** — read that before changing anyt
 |---|---|---|
 | `POST` | `/chat/stream` | OpenAI-shaped `{messages}` in, `text/event-stream` out |
 | `GET` | `/health` | liveness + resolved gateway/session config |
-| `GET` | `/v1/skills` | manifest: name, path, `requirements` per skill |
+| `GET` | `/v1/skills` | manifest: name, path, detected `requirements` per skill |
 | `GET` | `/v1/skills/<name>` | one skill's `SKILL.md` (fetched on demand by the agent) |
 | `GET` | `/v1/skills/<name>/bundle.tar.gz` | one skill incl. `scripts/` and `references/` |
 | `GET` | `/v1/skills/bundle.tar.gz` | all skills, version-matched to this deployment |
@@ -51,6 +51,10 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 On a session's **first turn** the adapter prepends a deployment-context block: where VSS
 is, the skills index (name + description), how to fetch a skill's full instructions, and
 the VSS conventions. ~6.6 KB.
+
+Each skill is listed as `- <name> [needs: uv, docker, ...]: <description>` so the agent
+sees the cost at selection time. Without that it refuses for plausible-but-wrong reasons
+— see DECISIONS.md §2.8c.
 
 This is what makes BYO work without an install step — it needs nothing from the harness
 but the ability to accept text, and skill bodies (~345 KB across 18 skills) stay remote

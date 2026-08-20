@@ -166,6 +166,40 @@ bootstrap turn makes the agent reply to it, surfacing a stray message to the use
 Verified: on a fresh session, asked which skill searches archived video, the agent
 answered `vss-search-archive` — information it could only have from the injected index.
 
+### 2.8c Skill requirements are real, and most VSS skills are host-oriented
+
+Audit of the 18 skills, by what their `SKILL.md` actually reaches for:
+
+| Requirement | Skills |
+|---|---|
+| `docker` | 17 |
+| `curl` | 16 |
+| `jq` | 11 |
+| `mcp` | 5 |
+| `uv` | 5 |
+| `vss-repo` (source checkout + CLI) | 3 |
+
+The nemoclaw sandbox provides `curl`, `jq`, `python3`, `git`, `node` — but **not
+`docker` and not `uv`**. So `vss-search-archive`, `vss-summarize-video`, and
+`vss-build-vision-agent` cannot run there at all: they drive a host CLI
+(`vss search run` via `uv`) against a repo checkout, not an HTTP API.
+
+Two consequences:
+
+1. The manifest's `requirements` must be **detected per skill**, not hardcoded. The
+   original uniform `[shell, curl, network]` was actively misleading.
+2. Requirements belong **inline in the bootstrap index**, next to each skill name —
+   not in a footnote. Observed failure: with requirements absent from the index, asked
+   to search archived video, the agent refused for a plausible-but-wrong reason ("the
+   orchestrator MCP is unreachable") because that was the nearest blocker it knew about.
+   That would send a user chasing the wrong fix. With `[needs: uv, vss-repo, docker, curl,
+   jq]` inline, it correctly reported `uv`, `vss-repo`, and `docker` missing while noting
+   `curl` and `jq` present.
+
+Detection is text-based, so it is a hint rather than a contract — some mentions are
+fallbacks or prohibitions ("do not run docker directly"). Still far better than a uniform
+claim. A future `requirements:` block in SKILL.md frontmatter would make it exact.
+
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
 **Decided:** support Case A. Defer Case B.
