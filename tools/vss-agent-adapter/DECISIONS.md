@@ -172,11 +172,12 @@ answered `vss-search-archive` — information it could only have from the inject
 
 - **Case A — their harness, our sandbox.** `nemoclaw onboard --agent hermes`. Everything
   built here applies: egress policy, `skill install`, workspace docs, `HOST_IP`. Cheap.
-- **Case B — their own sandbox.** Blocked on authn/authz. **The egress policy is
-  currently doing the job of authentication**: VSS backends on 8000/9901/9988 have no auth
-  of their own; they are safe only because the sole thing that can reach them is a
-  policy-constrained sandbox. Also `host.openshell.internal` does not exist outside an
-  OpenShell sandbox. Case B is a real project, not a distribution tweak.
+- **Case B — their own sandbox.** Requires real authn/authz at an ingress in front of
+  the VSS backends; today isolation comes from the sandbox egress policy, which only
+  holds while the agent runs inside a sandbox we control. Also
+  `host.openshell.internal` does not exist outside an OpenShell sandbox, so endpoint
+  resolution has to be served rather than assumed. Case B is a real project, not a
+  distribution tweak.
 
 ### 2.10 Multi-user is a correctness problem, decide before building further
 
