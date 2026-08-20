@@ -1,7 +1,9 @@
 # VSS ⇄ BYO Agent — Decisions & Context
 
-**Status:** POC wired and working end to end.
-**Date:** 2026-08-19
+**Status:** POC wired and working end to end. Chat, streaming, tool progress, skill
+discovery and archive-search plumbing all verified; archive *retrieval* is blocked on an
+open VSS issue (2.8e).
+**Date:** 2026-08-19, updated 2026-08-20
 **Reference environment:** Brev/OCI instance, 4x L40S, VSS `search` profile.
 
 ---
@@ -317,14 +319,20 @@ The gateway's JSON-schema errors are precise — use it as an oracle when extend
 
 ## 4. What is built and running
 
-### Adapter — `/home/nvidia/vss-agent-adapter/adapter.py`
+### Adapter — `tools/vss-agent-adapter/adapter.py`
 
-~190 lines, stdlib + `websocket-client`. Listens on `0.0.0.0:9098`.
+Python stdlib + `websocket-client`. Listens on `0.0.0.0:9098`.
 
-```
-POST /chat/stream   OpenAI-shaped {messages} -> text/event-stream
-GET  /health
-```
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/chat/stream` | OpenAI-shaped `{messages}` in, `text/event-stream` out |
+| `POST` | `/v1/search` | archive search over HTTP (runs the host `vss` CLI) |
+| `GET` | `/health` | liveness + resolved gateway/session config + skill count |
+| `GET` | `/v1/skills` | manifest: name, path, description, detected `requirements` |
+| `GET` | `/v1/skills/<name>` | one skill's `SKILL.md`, fetched on demand |
+| `GET` | `/v1/skills/<name>/bundle.tar.gz` | one skill incl. `scripts/` + `references/` |
+| `GET` | `/v1/skills/bundle.tar.gz` | all skills |
+| `GET` | `/v1/skills/env` | resolved VSS base URLs |
 
 Maps gateway `chat` delta events → `data: {"choices":[{"delta":{"content": …}}]}`, and
 `agent` tool events → `intermediate_data:` lines (which the NAT UI renders as
@@ -336,30 +344,53 @@ sends, as `agent:main:vss-<conv>`.
 Run it:
 
 ```bash
-cd /home/nvidia/vss-agent-adapter
+cd ~/vss-agent-adapter
 ADAPTER_PORT=9098 \
+ADAPTER_PUBLIC_URL="http://host.openshell.internal:9098" \
 OPENCLAW_GATEWAY_TOKEN="$(nemoclaw demo gateway-token | head -1)" \
   python3 adapter.py
 ```
 
+Restart it by port rather than by name — `pkill -f adapter.py` matches the invoking
+shell and kills the caller:
+
+```bash
+PID=$(ss -tlnp | grep ':9098 ' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | head -1)
+[ -n "$PID" ] && kill "$PID"
+```
+
+Full env table in `README.md`. Access control, keepalives and stream termination are
+covered in 6.3 and 6.5.
+
 ### UI wiring
 
-`deploy/docker/resolved.yml` line ~1459 (backup: `resolved.yml.bak-*`):
+`deploy/docker/resolved.yml` (backups: `resolved.yml.bak-*`):
 
 ```yaml
 NEXT_PUBLIC_SIDEBAR_CHAT_HTTP_CHAT_COMPLETION_URL: http://172.19.0.1:9098/chat/stream
+NEXT_PUBLIC_SIDEBAR_CHAT_DARK_THEME_DEFAULT: 'false'     # app stays 'true'
+NEXT_PUBLIC_SIDEBAR_CHAT_WORKFLOW: 🦙 NemoClaw Agent      # app stays 'Vision Agent'
 ```
 
 `172.19.0.1` is the `vss_default` bridge gateway. **No tunnel is needed**: `chat.ts` is a
 Next.js *edge API route*, so the `fetch` happens server-side from inside the UI container,
 not from the browser.
 
+The theming is deliberate: the sidebar renders light against the dark app and carries a
+different title, so it is obvious at a glance which panel is NemoClaw-backed and which is
+the original `vss-agent`. Both are config-only; the sidebar has its own `SIDEBAR_CHAT_*`
+env namespace that falls back to the app-wide values.
+
+> Beware duplicate YAML keys when editing `resolved.yml`: `SIDEBAR_CHAT_DARK_THEME_DEFAULT`
+> and `SIDEBAR_CHAT_WORKFLOW` already exist further down the file. Appending a second copy
+> is silently ignored (last one wins).
+
 The UI uses `next-runtime-env` (`/__ENV.js`), so `NEXT_PUBLIC_*` are injected at
 **container start, not build time** — changing the backend is an env change plus restart,
 no rebuild:
 
 ```bash
-cd /home/nvidia/video-search-and-summarization/deploy/docker
+cd ~/video-search-and-summarization/deploy/docker
 docker compose -p vss -f resolved.yml \
   --env-file developer-profiles/dev-profile-search/.env \
   --env-file developer-profiles/dev-profile-search/generated.env \
@@ -367,19 +398,27 @@ docker compose -p vss -f resolved.yml \
 ```
 
 `NEXT_PUBLIC_WEB_SOCKET_DEFAULT_ON=false` (and the sidebar variant), so HTTP mode is the
-default and the SSE path is used.
+default and the SSE path is used — but see 6.6, `sessionStorage` overrides this per
+browser and silently bypasses the adapter.
 
-> `resolved.yml` is **generated** by the deploy tooling — this edit will be overwritten on
-> the next profile regeneration. Fine for a POC; make it a real env var before it matters.
+> `resolved.yml` is **generated** by the deploy tooling — these edits will be overwritten
+> on the next profile regeneration. Fine for a POC; make them real env vars before it
+> matters.
 
-### Verified
+### Verified end to end
 
-- Adapter → gateway → agent, streamed: 15 SSE frames.
-- UI `/api/chat` → adapter (seen in adapter log from `172.19.0.6`) → clean answer.
+- Adapter → gateway → agent, streaming: multiple SSE frames, real token deltas.
+- UI `/api/chat` → adapter (adapter log shows the UI container `172.19.0.6`) → clean
+  answer, with `<intermediatestep>` tool progress rendering in the UI.
+- Bootstrap: on a fresh session the agent named `vss-search-archive` as the right skill,
+  and correctly reported `uv`/`vss-repo`/`docker` missing when asked to run it.
+- Agent → `POST /v1/search` from inside the sandbox, reaching the host CLI.
 
 ---
 
-## 5. NemoClaw deployment (built during this work)
+## 5. Environment state (as built)
+
+### NemoClaw
 
 | Setting | Value |
 |---|---|
@@ -387,20 +426,57 @@ default and the SSE path is used.
 | Harness | OpenClaw 2026.6.10 |
 | Model | `nvidia/nemotron-3-super-120b-a12b` (build.nvidia.com) |
 | Install ref | `v0.0.80` |
-| Dashboard | `https://<your-tunnel-or-host>:18789/#token=<gateway-token>` |
-| Policy | v4, `vss` preset over installer's balanced tier |
-| Skills | 18 installed |
+| Dashboard | `https://<tunnel-or-host>/#token=<gateway-token>` (no port suffix) |
+| Policy | **v5** — `vss` preset incl. adapter port 9098 |
+| Skills | 18 installed in-sandbox (also served over HTTP by the adapter) |
 | Hooks | enabled; token in `~/.nemoclaw_hooks_token` |
 | API key | `~/.nvidia_api_key` (0600) |
+| Workspace | `BOOTSTRAP.md` retired (see 6.1) |
 
-Get the gateway token: `nemoclaw demo gateway-token`.
-The token goes in the URL **fragment** (`#token=`), not a paste field — fragments are
-never sent to the server, so the token does not traverse Cloudflare's edge.
+Get the gateway token: `nemoclaw demo gateway-token`. It goes in the URL **fragment**
+(`#token=`), not a paste field — fragments are never sent to the server, so the token does
+not traverse Cloudflare's edge. The installer prints the dashboard URL with `:18789`
+appended, which is wrong for a tunnel; use the bare origin.
 
 **The tunnel is load-bearing.** `CHAT_UI_URL` is baked at onboard and `gateway.*` is
-read-only afterward. The cloudflared quick tunnel (PID varies, `--url http://localhost:18789`)
-has **no supervisor** — if it dies the hostname changes and the sandbox must be re-onboarded.
+read-only afterward. The cloudflared quick tunnel (`--url http://localhost:18789`) has
+**no supervisor** — if it dies the hostname changes and the sandbox must be re-onboarded.
 Add a systemd unit before relying on this.
+
+### VSS deployment
+
+- Profile: `search`. Public origin is a cloudflared quick tunnel onto haproxy `:7777`.
+- **Public access requires HTTP basic auth.** haproxy challenges only requests carrying
+  `CF-Connecting-IP`, so direct/localhost access stays unauthenticated for in-cluster
+  callers and on-host probes. A `demo` user was added alongside the existing `vss` user in
+  `deploy/docker/services/infra/haproxy/haproxy.auth.cfg` (untracked local overlay,
+  contains password hashes — deliberately not committed). Credentials live in
+  `~/vss-agent-adapter/.ui-credentials` (0600).
+- haproxy runs master-worker (`-W`), so `docker kill -s USR2 vss-haproxy-ingress` reloads
+  config with **zero downtime**. No need to restart the container.
+- Host SSH (port 22) is **not** reachable from the internet — OCI blocks it. Use the Brev
+  CLI (`brev ls`, `brev shell <alias>`) if you need a shell.
+
+### Search data and CLI
+
+- `vss configure --base-url http://localhost:7777` has been run; config at
+  `~/.vss/config.json`, 6/7 services routed (`lvs` absent, expected for this profile).
+  Re-run it after any ingestion — the recorded index inventory is a snapshot.
+- A test clip is ingested: `byo_clip2.mp4`, sensor `1b2508e2-05e0-4840-a55c-93f71748c01a`,
+  2 chunks, index `mdx-embed-filtered-2025-01-01` with 4 docs and real 768-dim vectors.
+  Retrieval still returns nothing — see 2.8e.
+- Use the **internal** origin for programmatic uploads. The public origin now requires
+  basic auth; browsers cache credentials, scripts do not.
+
+### Source
+
+Work lives on branch `feat/byo-agent-adapter-poc`, pushed to the fork
+`github.com/ashan-nv/video-search-and-summarization` (added as remote `fork`).
+`origin` is the public NVIDIA-AI-Blueprints repo — POC branches do not belong there.
+
+Committed: `tools/vss-agent-adapter/` and the policy change adding port 9098.
+Deliberately not committed: `deploy/docker/resolved.yml` (generated, gitignored) and
+`haproxy.auth.cfg` (local overlay, carries credentials).
 
 ---
 
@@ -480,19 +556,39 @@ Add a systemd unit before relying on this.
    only assigns `NVIDIA_API_KEY` and `NEMOCLAW_MODEL`. Since cell 12 derives
    `NEMOCLAW_PROVIDER = "custom" if NEMOCLAW_ENDPOINT_URL else "build"`, running cell 6 or 8
    first in the same kernel silently onboards against a stale endpoint.
+5. **Archive search fails silently.** Zero hits and an empty `search_messages` are
+   indistinguishable from "retrieval is misconfigured" (2.8e). A caller — human or agent —
+   cannot tell the difference, and an agent will confabulate a reason. The CLI should say
+   why it found nothing.
+6. **Skill requirements are undeclared.** Requirements have to be guessed by grepping
+   `SKILL.md` prose (2.8c). A `requirements:` block in the frontmatter would make this
+   exact instead of heuristic, and would let any host check runnability before starting.
+7. **Long-running containers silently outlive their config.** `vss-agent` served upload
+   URLs on a dead hostname for days while `resolved.yml` held the correct one (2.8e).
+   Nothing surfaces the drift; a deploy-time check comparing container env against the
+   resolved config would catch it.
 
 ---
 
 ## 8. Next steps
 
-1. Delete `agentResponseParser.ts`'s full-payload parsing; shrink to the `vss_artifact`
-   reference marker. Update `vss-search-archive` to emit it.
-2. ~~Build `GET /v1/skills/bundle.tar.gz` + `GET /v1/skills/env`~~ — **done** (in the
-   adapter; move into VSS proper when the contract firms up). Also serves `GET /v1/skills`
-   as a manifest with a per-skill `requirements` list, so a harness lacking a shell can
-   tell up front that it cannot run them.
-3. Decide multi-user isolation (§2.10) before more UI work.
+1. **Unblock retrieval** (2.8e). Everything else about search now works: ingestion,
+   indexing with real vectors, the CLI, the HTTP endpoint, and the agent reaching it. The
+   query-side embedding path is the one broken link, and the artifact/rendering work below
+   is gated on it — there is nothing to render until search returns hits.
+2. Then: delete `agentResponseParser.ts`'s full-payload parsing and shrink it to the
+   `vss_artifact` reference marker; update `vss-search-archive` to emit it.
+3. **Decide multi-user isolation (2.10) before more UI work.** Still the item most likely
+   to force a rewrite if deferred.
 4. Write the contract spec as a reviewable doc so a BYO integrator has something to build
-   against.
-5. Post-POC: typed SSE events (§2.5), `registerArtifactHandler(kind, …)` replacing
+   against without reading this file.
+5. Move the skills endpoints out of the adapter into VSS proper once the contract firms
+   up — they are VSS's to serve, not the reference adapter's.
+6. Supervise the cloudflared tunnel (systemd unit). It is load-bearing and unmonitored.
+7. Post-POC: typed SSE events (2.5), `registerArtifactHandler(kind, …)` replacing
    `registerChatAnswerHandler`, `Last-Event-ID` resumability for multi-minute turns.
+
+**Done since first draft:** skills endpoints + per-skill fetch, prompt bootstrap (2.8b),
+real requirement detection (2.8c), archive search over HTTP (2.8d), adapter access control
++ SSE keepalives + stream termination (6.3, 6.5), `BOOTSTRAP.md` retirement (6.1), and the
+stale-container upload-URL fix (2.8e).
