@@ -225,6 +225,34 @@ Elasticsearch. The agent's request reaches `/v1/search` and it reports the true 
 ingested`). **Not yet verified against real results** — nothing has been ingested on this
 deployment, so the happy path with actual hits is untested.
 
+### 2.8e Ingestion works; retrieval returns nothing (open VSS issue)
+
+To test `/v1/search` against real data, a clip was ingested through the documented
+Agent-backed flow (`POST /api/v1/videos` -> upload -> `/complete`). It succeeded:
+`"embeddings generated", chunks_processed: 2`, and `mdx-embed-filtered-2025-01-01` now
+holds 4 docs with real 768-dim vectors at `llm.visionEmbeddings[0].vector`, mapped as
+`dense_vector`. Index model (`cosmos-embed1-448p-anomaly-detection`) matches the model
+rt-embed serves.
+
+**But every search returns `{"data": [], "search_messages": []}`** — zero hits, no
+diagnostic — including with `--min-cosine-similarity 0.0`, an explicit `--video-source`,
+explicit `--source-type`, and explicit time bounds covering the indexed window. The CLI
+has the right index recorded in `~/.vss/config.json`.
+
+Unresolved: where the *query-side* text embedding comes from. `rt-embed`'s OpenAPI
+exposes only files/metrics/health paths — no text-embedding route — and `/v1/embeddings`
+and `/v1/embed` both 404. Indexing is a video-embedding path; the query path is not
+obviously served by the same component.
+
+This is a VSS retrieval issue, not an adapter one: `/v1/search` faithfully returns
+whatever the CLI produces. Worth noting that the empty `search_messages` makes this
+silent — a caller cannot distinguish "no matches" from "retrieval is misconfigured".
+
+**Also found:** `vss-agent` hands out upload URLs built from a stale
+`VSS_AGENT_EXTERNAL_URL` pointing at a dead cloudflare hostname, so the documented
+ingestion flow fails at step 2 unless the origin is substituted. Same quick-tunnel
+instability noted for the dashboard.
+
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
 **Decided:** support Case A. Defer Case B.
