@@ -49,6 +49,20 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 | `VSS_REPO_ROOT` | `~/video-search-and-summarization` | checkout used by `/v1/search` |
 | `UV_BIN` | auto-detected | `uv` used to run the CLI |
 | `ADAPTER_SEARCH_TIMEOUT` | `180` | seconds |
+| `ADAPTER_ALLOW_CIDRS` | `127.0.0.1/32,::1/128,172.16.0.0/12` | callers allowed to reach the adapter |
+| `ADAPTER_TOKEN` | *(unset)* | if set, required via `Authorization: Bearer`, `X-Adapter-Token`, or `?token=` |
+| `ADAPTER_SSE_KEEPALIVE` | `15` | seconds between SSE keepalive comments |
+
+## Access control
+
+The adapter holds the gateway token and can drive the agent, so it must not be reachable
+by anything that can route to it. It binds `0.0.0.0` by necessity (the UI container and
+the sandbox both reach it over docker bridges), so the control is a **caller allowlist**
+plus an **optional shared token**.
+
+`?token=` exists because `chat.ts` sends a fixed header set with no auth header but passes
+its configured URL through verbatim — a query param is the only way to authenticate
+without changing UI code.
 
 ## Archive search
 

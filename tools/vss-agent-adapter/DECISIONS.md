@@ -408,8 +408,13 @@ Add a systemd unit before relying on this.
 
 1. **Session choice matters.** Reusing `agent:main:main` made the agent reply as if
    answering a heartbeat poll (walking its `AGENTS.md` checklist). Fresh per-conversation
-   sessions fix that — but each new session runs `BOOTSTRAP.md`. It self-deletes after
-   first run; decide between "let it run once" and a persistent per-user session.
+   sessions fix that — but each new session re-ran `BOOTSTRAP.md`, so every conversation
+   opened with an environment probe instead of an answer.
+
+   **Resolved** by retiring `BOOTSTRAP.md` in the sandbox workspace (renamed
+   `.retired`; the file itself says "Read this once, then delete it" and the agent never
+   did). The adapter's first-turn context (2.8b) supplies the same deployment information
+   on every session, which is strictly better: it cannot go stale and needs no workspace.
 2. **Nemotron sometimes leaks chain-of-thought into message content**, despite the
    gateway reporting `thinkingDefault: "off"`. **This is not filterable** — verified that
    the final message carries a single `type: "text"` content part with no separate
@@ -420,13 +425,27 @@ Add a systemd unit before relying on this.
    Harness *sentinels* (`NO_REPLY`, `HEARTBEAT_OK`) are a separate matter — those are
    exact tokens and are now stripped by `SentinelFilter`, which holds back a short tail so
    a sentinel split across two deltas is still caught without breaking streaming.
-3. **Adapter has no auth.** It holds the gateway token and accepts any caller. Loopback +
-   docker bridge only for now.
+3. ~~**Adapter has no auth.**~~ **Fixed.** Callers must come from an allowlisted CIDR
+   (`127.0.0.1`, `::1`, `172.16.0.0/12` by default — loopback plus docker bridges), and an
+   optional `ADAPTER_TOKEN` can be required on top. The token is accepted via
+   `Authorization: Bearer`, `X-Adapter-Token`, **or `?token=`** — the query form exists
+   because `chat.ts` sends a fixed header set with no auth header but passes its
+   configured URL through verbatim, so a query param is the only way to authenticate
+   without UI changes. Default deployment is allowlist-only: requiring a token would mean
+   embedding it in `ADAPTER_PUBLIC_URL`, which lands in the agent's prompt where it could
+   be echoed back to a user.
 4. **Artifact ingest, when built, must not be keyed on session id alone** — that is
    forgeable; anyone reaching the bridge could inject results into a live turn. Mint a
    short-lived per-turn token.
-5. **SSE keepalives** — send a comment ping every ~15s or proxy idle timeouts will kill
-   long turns.
+5. ~~**SSE keepalives**~~ **Done.** A `: keepalive` comment every `ADAPTER_SSE_KEEPALIVE`
+   seconds (default 15) whenever the gateway is silent, so cloudflared/haproxy do not drop
+   a stream while a skill runs.
+
+   Fixing this surfaced a worse bug: the SSE response was sent on a kept-alive HTTP/1.1
+   connection with no `Content-Length`, so **the client could not tell the response had
+   ended**. A turn that finished in seconds left curl blocked until its 240s timeout, and
+   would leave the UI stuck showing "streaming" indefinitely. Now sends
+   `Connection: close` and sets `close_connection`; the same turn completes in 20s.
 6. **WebSocket mode silently bypasses the adapter.** `Chat.tsx` reads
    `sessionStorage.getItem('webSocketMode')` and that **overrides**
    `NEXT_PUBLIC_WEB_SOCKET_DEFAULT_ON=false`. With WS mode on, the UI talks to

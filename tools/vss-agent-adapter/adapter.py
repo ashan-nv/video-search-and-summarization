@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import io, json, os, queue, re, shutil, subprocess, tarfile, threading, uuid
+import io, ipaddress, json, os, queue, re, shutil, subprocess, tarfile, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -48,6 +48,26 @@ VSS_REPO_ROOT = os.environ.get(
 UV_BIN = os.environ.get("UV_BIN") or shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
 SEARCH_MODES = ("embed", "attribute", "fusion", "object")
 SEARCH_TIMEOUT = int(os.environ.get("ADAPTER_SEARCH_TIMEOUT", "180"))
+
+# --- access control -------------------------------------------------------
+# The adapter holds the gateway token and can drive the agent, so it must not
+# be open to anything that can route to it. It binds 0.0.0.0 by necessity (the
+# UI container and the sandbox both reach it over docker bridges), so the
+# control is a caller allowlist plus an optional shared token.
+#
+# `chat.ts` sends a fixed header set with no auth header, so the token is also
+# accepted as `?token=` -- the UI passes its configured URL through verbatim,
+# which makes a query param the only way to authenticate without UI changes.
+ADAPTER_TOKEN = os.environ.get("ADAPTER_TOKEN", "").strip()
+ALLOW_CIDRS = [
+    ipaddress.ip_network(c.strip())
+    for c in os.environ.get(
+        "ADAPTER_ALLOW_CIDRS", "127.0.0.1/32,::1/128,172.16.0.0/12").split(",")
+    if c.strip()
+]
+# Seconds between SSE keepalive comments. cloudflared/haproxy will drop an idle
+# stream, and an agent turn can be silent for minutes while a skill runs.
+SSE_KEEPALIVE = int(os.environ.get("ADAPTER_SSE_KEEPALIVE", "15"))
 
 SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
 _HOLD = max(len(x) for x in SENTINELS) - 1
@@ -239,6 +259,15 @@ class SentinelFilter:
         return text
 
 
+def _query_param(path, key):
+    _, _, qs = path.partition("?")
+    for pair in qs.split("&"):
+        name, _, value = pair.partition("=")
+        if name == key:
+            return value
+    return ""
+
+
 def sse(data: str) -> bytes:
     return f"data: {data}\n\n".encode()
 
@@ -406,6 +435,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[adapter] {self.address_string()} {fmt % args}", flush=True)
 
+    def _authorized(self):
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except (ValueError, IndexError):
+            return False
+        if not any(peer in net for net in ALLOW_CIDRS):
+            return False
+        if not ADAPTER_TOKEN:
+            return True
+        supplied = (self.headers.get("X-Adapter-Token")
+                    or (self.headers.get("Authorization", "")
+                        .removeprefix("Bearer ").strip())
+                    or _query_param(self.path, "token"))
+        return supplied == ADAPTER_TOKEN
+
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
@@ -445,6 +489,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self._authorized():
+            self.send_error(403, "forbidden")
+            return
         path = self.path.split("?")[0].rstrip("/") or "/"
 
         if path == "/v1/skills":
@@ -521,6 +568,9 @@ class Handler(BaseHTTPRequestHandler):
                     "skills": len(self._skills_manifest())})
 
     def do_POST(self):
+        if not self._authorized():
+            self.send_error(403, "forbidden")
+            return
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/chat/stream", "/generate/stream", "/v1/search"):
             self.send_error(404)
@@ -550,10 +600,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # Close when the turn ends. An SSE body has no Content-Length, so on a
+        # kept-alive HTTP/1.1 connection the client cannot tell the response is
+        # over and hangs after [DONE] -- the UI stays stuck "streaming".
+        self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         self._cors()
         self.end_headers()
+        self.close_connection = True
 
         # One session per UI conversation; header lets the UI keep continuity.
         conv = (self.headers.get("Conversation-Id")  # sent natively by the VSS UI
@@ -565,7 +619,12 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=run_turn, args=(user, session_key, out),
                          daemon=True).start()
         while True:
-            chunk = out.get()
+            try:
+                chunk = out.get(timeout=SSE_KEEPALIVE)
+            except queue.Empty:
+                # SSE comment: ignored by every client, keeps proxies from
+                # dropping a stream that is silent while a skill runs.
+                chunk = b": keepalive\n\n"
             if chunk is None:
                 break
             try:
