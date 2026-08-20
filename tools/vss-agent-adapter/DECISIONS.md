@@ -145,6 +145,27 @@ discovery fallback, per-profile path prefixes `/vst`, `/alert-bridge`, `/va-mcp`
 that is prose in `deployment_resolution.md` + an export in `ENV.md`. Serving it stops
 every BYO agent from re-deriving host resolution and getting it subtly wrong.
 
+### 2.8b Bootstrap by prompt, not by install
+
+**Decided:** the adapter prepends a deployment-context block to a session's **first
+turn**, carrying: where VSS is, the skills index (name + description), how to fetch a
+skill's full instructions, and the VSS conventions.
+
+Why this and not `skill install` + uploaded workspace docs:
+
+- It requires **nothing of the harness** except accepting text. `skill install` assumes an
+  OpenClaw-shaped workspace; a hosted BYO agent has no workspace at all.
+- It is always current — no snapshot to drift, no `make skills-sync`.
+- The index is inlined (~6.6 KB) rather than fetched, because a round trip is a step a
+  harness might simply not make. Skill **bodies** stay remote and are fetched on demand
+  (`GET /v1/skills/<name>`), so the ~345 KB of instructions never enters context.
+
+Prepended to the first user turn rather than sent as its own message: a standalone
+bootstrap turn makes the agent reply to it, surfacing a stray message to the user.
+
+Verified: on a fresh session, asked which skill searches archived video, the agent
+answered `vss-search-archive` — information it could only have from the injected index.
+
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
 **Decided:** support Case A. Defer Case B.

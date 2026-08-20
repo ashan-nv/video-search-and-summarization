@@ -32,8 +32,120 @@ HOST_ALIAS = os.environ.get("VSS_HOST_ALIAS", "host.openshell.internal")
 # Harness sentinels that must never reach a user. OpenClaw emits these for
 # heartbeat turns; they are exact tokens, unlike the model's chain-of-thought
 # which arrives as ordinary prose and is NOT safely strippable.
+BOOTSTRAP_ENABLED = os.environ.get("ADAPTER_BOOTSTRAP", "1") != "0"
+ADAPTER_PUBLIC_URL = os.environ.get(
+    "ADAPTER_PUBLIC_URL", f"http://{HOST_ALIAS}:{os.environ.get('ADAPTER_PORT', '9099')}")
+
 SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
 _HOLD = max(len(x) for x in SENTINELS) - 1
+
+
+def _frontmatter_description(skill_md):
+    """Pull `description:` out of SKILL.md YAML frontmatter (agentskills.io)."""
+    try:
+        with open(skill_md, encoding="utf-8", errors="replace") as fh:
+            if fh.readline().strip() != "---":
+                return ""
+            desc, cont = "", False
+            for line in fh:
+                if line.strip() == "---":
+                    break
+                if cont and (line.startswith("  ") or line.startswith("\t")):
+                    desc += " " + line.strip()
+                    continue
+                cont = False
+                if line.lower().startswith("description:"):
+                    val = line.split(":", 1)[1].strip().strip("\"'")
+                    # `>` / `|` are YAML block-scalar markers, not content --
+                    # the text itself is on the following indented lines.
+                    desc = "" if val[:1] in (">", "|") else val
+                    cont = True
+            return " ".join(desc.split())
+    except OSError:
+        return ""
+
+
+def skills_manifest():
+    """One entry per skill dir containing a SKILL.md.
+
+    Walks two levels: skills/<name>/ and skills/<group>/<name>/ -- the canonical
+    `skills/*/` glob misses the nested ones.
+    """
+    entries = []
+    if not os.path.isdir(SKILLS_DIR):
+        return entries
+    for root, dirs, files in os.walk(SKILLS_DIR):
+        if root.count(os.sep) - SKILLS_DIR.count(os.sep) > 2:
+            dirs[:] = []
+            continue
+        if "SKILL.md" in files:
+            entries.append({
+                "name": os.path.basename(root),
+                "path": os.path.relpath(root, SKILLS_DIR),
+                "description": _frontmatter_description(
+                    os.path.join(root, "SKILL.md")),
+                # Skills are curl recipes: they need a shell and network egress
+                # to the VSS backends. A harness without those cannot run them.
+                "requirements": ["shell", "curl", "network"],
+            })
+            dirs[:] = []
+    return sorted(entries, key=lambda e: e["name"])
+
+
+_BOOTSTRAP_CACHE = {}
+
+
+def BOOTSTRAP_TEXT():
+    if "text" not in _BOOTSTRAP_CACHE:
+        _BOOTSTRAP_CACHE["text"] = build_bootstrap(
+            skills_manifest(), ADAPTER_PUBLIC_URL)
+    return _BOOTSTRAP_CACHE["text"]
+
+
+def build_bootstrap(manifest, base_url):
+    """Context prepended to a session's first turn.
+
+    This is the whole BYO story in one string: it needs nothing from the harness
+    but the ability to accept text, so it works for any agent -- unlike
+    `skill install`, which assumes an OpenClaw-shaped workspace.
+
+    The skills *index* is inlined (small, and removes a round trip that a harness
+    might simply not make). Skill *bodies* stay remote and are fetched on demand.
+    """
+    lines = [
+        "# VSS deployment context",
+        "",
+        "You are connected to a NVIDIA VSS (Video Search and Summarization)",
+        "deployment. The user is talking to you from the VSS UI.",
+        "",
+        "## Reaching VSS",
+        f"Base URL for VSS agent APIs: {base_url}",
+        f"Resolved service endpoints: GET {base_url}/v1/skills/env",
+        "Inside a sandbox, always call the host alias from that document -- never",
+        "`localhost` and never a literal IP, or the egress policy denies the call.",
+        "",
+        "## Your skills",
+        "Each skill below is a set of instructions for one task. When a request",
+        "matches a description, FETCH that skill's instructions first and follow",
+        f"them:  GET {base_url}/v1/skills/<name>",
+        "Do not guess at a skill's steps from its description alone.",
+        "",
+    ]
+    for e in manifest:
+        lines.append(f"- {e['name']}: {e.get('description') or '(no description)'}")
+    lines += [
+        "",
+        "## Conventions",
+        "- Deployment/teardown goes through the VSS Orchestrator MCP, never raw",
+        "  `docker compose` or host shell commands.",
+        "- Report progress in chat as you go; do not go silent during long tasks.",
+        "- Never invent a host:port URL for the user; read the deployed public",
+        "  origin from the deployment rather than constructing one.",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 class SentinelFilter:
@@ -68,6 +180,10 @@ class SentinelFilter:
 
 def sse(data: str) -> bytes:
     return f"data: {data}\n\n".encode()
+
+
+BOOTSTRAPPED = set()
+_BOOTSTRAP_LOCK = threading.Lock()
 
 
 def run_turn(message: str, session_key: str, out: queue.Queue):
@@ -107,6 +223,15 @@ def run_turn(message: str, session_key: str, out: queue.Queue):
         # inherits heartbeat/main-session history and derails the reply.
         req("sessions.create", {"key": session_key})
         req("sessions.messages.subscribe", {"key": session_key})
+        # Prepend deployment context on a session's first turn only. Sending it
+        # as its own turn would make the agent reply to it and surface a stray
+        # message to the user.
+        with _BOOTSTRAP_LOCK:
+            first_turn = session_key not in BOOTSTRAPPED
+            BOOTSTRAPPED.add(session_key)
+        if first_turn and BOOTSTRAP_ENABLED:
+            message = BOOTSTRAP_TEXT() + message
+
         req("chat.send", {"sessionKey": session_key, "message": message,
                           "idempotencyKey": str(uuid.uuid4())})
 
@@ -185,29 +310,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _skills_manifest(self):
-        """One entry per skill dir containing a SKILL.md.
+        return skills_manifest()
 
-        Walks two levels: skills/<name>/ and skills/<group>/<name>/ — the
-        canonical `skills/*/` glob misses the nested ones.
-        """
-        entries = []
-        if not os.path.isdir(SKILLS_DIR):
-            return entries
-        for root, dirs, files in os.walk(SKILLS_DIR):
-            if root.count(os.sep) - SKILLS_DIR.count(os.sep) > 2:
-                dirs[:] = []
-                continue
-            if "SKILL.md" in files:
-                entries.append({
-                    "name": os.path.basename(root),
-                    "path": os.path.relpath(root, SKILLS_DIR),
-                    # Skills are curl recipes: they need a shell and network
-                    # egress to the VSS backends. A harness without those
-                    # cannot run them, so advertise it up front.
-                    "requirements": ["shell", "curl", "network"],
-                })
-                dirs[:] = []
-        return sorted(entries, key=lambda e: e["name"])
+    def _tgz(self, members, filename):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for arcname, src in members.items():
+                tar.add(src, arcname=arcname)
+        data = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{filename}"')
+        self._cors()
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -235,6 +353,30 @@ class Handler(BaseHTTPRequestHandler):
                 },
             })
             return
+
+        if path.startswith("/v1/skills/") and path != "/v1/skills/env":
+            rest = path[len("/v1/skills/"):]
+            want_bundle = rest.endswith("/bundle.tar.gz")
+            name = rest[:-len("/bundle.tar.gz")] if want_bundle else rest
+            entry = next((e for e in skills_manifest() if e["name"] == name), None)
+            if entry:
+                skill_dir = os.path.join(SKILLS_DIR, entry["path"])
+                if want_bundle:
+                    self._tgz({name: skill_dir}, f"{name}.tar.gz")
+                    return
+                with open(os.path.join(skill_dir, "SKILL.md"),
+                          encoding="utf-8", errors="replace") as fh:
+                    body = fh.read().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if name != "bundle.tar.gz":
+                self._json({"error": f"unknown skill: {name}"}, 404)
+                return
 
         if path == "/v1/skills/bundle.tar.gz":
             buf = io.BytesIO()

@@ -17,6 +17,8 @@ notes are in **[DECISIONS.md](DECISIONS.md)** — read that before changing anyt
 | `POST` | `/chat/stream` | OpenAI-shaped `{messages}` in, `text/event-stream` out |
 | `GET` | `/health` | liveness + resolved gateway/session config |
 | `GET` | `/v1/skills` | manifest: name, path, `requirements` per skill |
+| `GET` | `/v1/skills/<name>` | one skill's `SKILL.md` (fetched on demand by the agent) |
+| `GET` | `/v1/skills/<name>/bundle.tar.gz` | one skill incl. `scripts/` and `references/` |
 | `GET` | `/v1/skills/bundle.tar.gz` | all skills, version-matched to this deployment |
 | `GET` | `/v1/skills/env` | resolved VSS base URLs (replaces `HOST_IP` guessing) |
 
@@ -41,6 +43,18 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 | `ADAPTER_TURN_TIMEOUT` | `600` | seconds |
 | `VSS_SKILLS_DIR` | `~/video-search-and-summarization/skills` | source for the skills endpoints |
 | `VSS_HOST_ALIAS` | `host.openshell.internal` | advertised by `/v1/skills/env` |
+| `ADAPTER_BOOTSTRAP` | `1` | set `0` to disable first-turn context injection |
+| `ADAPTER_PUBLIC_URL` | `http://<alias>:<port>` | base URL the agent is told to fetch from |
+
+## Bootstrap
+
+On a session's **first turn** the adapter prepends a deployment-context block: where VSS
+is, the skills index (name + description), how to fetch a skill's full instructions, and
+the VSS conventions. ~6.6 KB.
+
+This is what makes BYO work without an install step — it needs nothing from the harness
+but the ability to accept text, and skill bodies (~345 KB across 18 skills) stay remote
+until one is actually needed.
 
 Requires `websocket-client` (`pip install websocket-client`).
 
