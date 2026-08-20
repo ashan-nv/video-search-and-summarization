@@ -224,8 +224,9 @@ Adding port 9098 and re-running `policy-add` (version 5) fixed it.
 Verified end to end: UI -> adapter -> gateway -> agent -> HTTP -> adapter -> uv -> CLI ->
 Elasticsearch. The agent's request reaches `/v1/search` and it reports the true blocker
 (`Search index 'mdx-embed-filtered-*' does not exist. Please ensure videos have been
-ingested`). **Not yet verified against real results** — nothing has been ingested on this
-deployment, so the happy path with actual hits is untested.
+ingested`) rather than guessing at networking. A clip has since been ingested and the
+index exists — but retrieval still returns nothing, so the happy path with actual hits
+remains untested. See 2.8e.
 
 ### 2.8e Ingestion works; retrieval returns nothing (open VSS issue)
 
