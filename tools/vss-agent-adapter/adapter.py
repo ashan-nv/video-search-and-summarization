@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import json, os, queue, threading, uuid
+import io, json, os, queue, tarfile, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -24,6 +24,46 @@ GATEWAY_TOKEN = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
 SESSION_PREFIX = os.environ.get("OPENCLAW_SESSION_PREFIX", "agent:main:vss")
 LISTEN_PORT = int(os.environ.get("ADAPTER_PORT", "9099"))
 TURN_TIMEOUT = int(os.environ.get("ADAPTER_TURN_TIMEOUT", "600"))
+SKILLS_DIR = os.environ.get(
+    "VSS_SKILLS_DIR",
+    os.path.expanduser("~/video-search-and-summarization/skills"))
+HOST_ALIAS = os.environ.get("VSS_HOST_ALIAS", "host.openshell.internal")
+
+# Harness sentinels that must never reach a user. OpenClaw emits these for
+# heartbeat turns; they are exact tokens, unlike the model's chain-of-thought
+# which arrives as ordinary prose and is NOT safely strippable.
+SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
+_HOLD = max(len(x) for x in SENTINELS) - 1
+
+
+class SentinelFilter:
+    """Strip sentinel tokens from a token stream without breaking streaming.
+
+    Holds back the last `_HOLD` characters so a sentinel split across two
+    deltas ("NO_" + "REPLY") is still caught, then flushes the remainder.
+    """
+
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, text: str) -> str:
+        # Strip the whole buffer BEFORE splitting: stripping only the emitted
+        # prefix lets a sentinel spanning the emit/holdback boundary escape.
+        self.buf = self._strip(self.buf + text)
+        if len(self.buf) <= _HOLD:
+            return ""
+        emit, self.buf = self.buf[:-_HOLD], self.buf[-_HOLD:]
+        return emit
+
+    def flush(self) -> str:
+        out, self.buf = self._strip(self.buf), ""
+        return out
+
+    @staticmethod
+    def _strip(text: str) -> str:
+        for token in SENTINELS:
+            text = text.replace(token, "")
+        return text
 
 
 def sse(data: str) -> bytes:
@@ -71,6 +111,7 @@ def run_turn(message: str, session_key: str, out: queue.Queue):
                           "idempotencyKey": str(uuid.uuid4())})
 
         step = 0
+        sentinels = SentinelFilter()
         while True:
             msg = json.loads(ws.recv())
             if msg.get("type") == "res" and msg.get("ok") is False:
@@ -84,9 +125,15 @@ def run_turn(message: str, session_key: str, out: queue.Queue):
 
             if ev == "chat":
                 if p.get("state") == "delta" and p.get("deltaText"):
-                    out.put(sse(json.dumps(
-                        {"choices": [{"delta": {"content": p["deltaText"]}}]})))
+                    clean = sentinels.feed(p["deltaText"])
+                    if clean:
+                        out.put(sse(json.dumps(
+                            {"choices": [{"delta": {"content": clean}}]})))
                 elif p.get("state") == "final":
+                    tail = sentinels.flush()
+                    if tail:
+                        out.put(sse(json.dumps(
+                            {"choices": [{"delta": {"content": tail}}]})))
                     break
             elif ev == "agent" and p.get("stream") == "tool":
                 # Surface tool activity as NAT-UI intermediate steps.
@@ -128,18 +175,90 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_GET(self):
-        if self.path.rstrip("/") != "/health":
-            self.send_error(404)
-            return
-        body = json.dumps({"ok": True, "gateway": GATEWAY_URL,
-                           "sessionPrefix": SESSION_PREFIX}).encode()
-        self.send_response(200)
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, indent=1).encode()
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self._cors()
         self.end_headers()
         self.wfile.write(body)
+
+    def _skills_manifest(self):
+        """One entry per skill dir containing a SKILL.md.
+
+        Walks two levels: skills/<name>/ and skills/<group>/<name>/ — the
+        canonical `skills/*/` glob misses the nested ones.
+        """
+        entries = []
+        if not os.path.isdir(SKILLS_DIR):
+            return entries
+        for root, dirs, files in os.walk(SKILLS_DIR):
+            if root.count(os.sep) - SKILLS_DIR.count(os.sep) > 2:
+                dirs[:] = []
+                continue
+            if "SKILL.md" in files:
+                entries.append({
+                    "name": os.path.basename(root),
+                    "path": os.path.relpath(root, SKILLS_DIR),
+                    # Skills are curl recipes: they need a shell and network
+                    # egress to the VSS backends. A harness without those
+                    # cannot run them, so advertise it up front.
+                    "requirements": ["shell", "curl", "network"],
+                })
+                dirs[:] = []
+        return sorted(entries, key=lambda e: e["name"])
+
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/") or "/"
+
+        if path == "/v1/skills":
+            self._json({"count": len(self._skills_manifest()),
+                        "skills": self._skills_manifest()})
+            return
+
+        if path == "/v1/skills/env":
+            # Where VSS actually is, so a BYO agent does not have to re-derive
+            # host resolution from prose in deployment_resolution.md / ENV.md.
+            self._json({
+                "host_alias": HOST_ALIAS,
+                "note": "In-sandbox only. Never use localhost or a literal IP; "
+                        "the egress policy whitelists this alias on fixed ports.",
+                "services": {
+                    "vss_agent": f"http://{HOST_ALIAS}:8000",
+                    "orchestrator_mcp": f"http://{HOST_ALIAS}:9988/mcp",
+                    "va_mcp": f"http://{HOST_ALIAS}:9901",
+                    "alert_bridge": f"http://{HOST_ALIAS}:9080",
+                    "elasticsearch": f"http://{HOST_ALIAS}:9200",
+                    "vst_vios": f"http://{HOST_ALIAS}:30888",
+                    "rt_vlm": f"http://{HOST_ALIAS}:8018",
+                },
+            })
+            return
+
+        if path == "/v1/skills/bundle.tar.gz":
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for e in self._skills_manifest():
+                    tar.add(os.path.join(SKILLS_DIR, e["path"]),
+                            arcname=e["name"])
+            data = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="vss-skills.tar.gz"')
+            self._cors()
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path != "/health":
+            self.send_error(404)
+            return
+        self._json({"ok": True, "gateway": GATEWAY_URL,
+                    "sessionPrefix": SESSION_PREFIX,
+                    "skills": len(self._skills_manifest())})
 
     def do_POST(self):
         if self.path.split("?")[0].rstrip("/") not in ("/chat/stream", "/generate/stream"):

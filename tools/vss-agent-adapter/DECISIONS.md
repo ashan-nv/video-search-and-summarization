@@ -132,7 +132,7 @@ this", "explain this incident"), not for viewing them.
 
 ### 2.8 Skills distribution: serve from VSS
 
-**Decided (not yet built):**
+**Decided — implemented in the adapter for the POC** (belongs in VSS proper later):
 
 ```
 GET /v1/skills/bundle.tar.gz   # version-matched to this deployment
@@ -292,9 +292,16 @@ Add a systemd unit before relying on this.
    answering a heartbeat poll (walking its `AGENTS.md` checklist). Fresh per-conversation
    sessions fix that — but each new session runs `BOOTSTRAP.md`. It self-deletes after
    first run; decide between "let it run once" and a persistent per-user session.
-2. **Nemotron leaks chain-of-thought into message content**, despite the gateway
-   reporting `thinkingDefault: "off"`. Either filter in the adapter or try
-   `openai/gpt-oss-120b`.
+2. **Nemotron sometimes leaks chain-of-thought into message content**, despite the
+   gateway reporting `thinkingDefault: "off"`. **This is not filterable** — verified that
+   the final message carries a single `type: "text"` content part with no separate
+   reasoning field, so reasoning is indistinguishable from the answer. It is also
+   intermittent: ordinary turns stream clean prose; it surfaced on bootstrap-heavy turns.
+   Mitigation is a different model (`openai/gpt-oss-120b`) or prompt work, **not** a regex
+   in the adapter, which would eat legitimate content.
+   Harness *sentinels* (`NO_REPLY`, `HEARTBEAT_OK`) are a separate matter — those are
+   exact tokens and are now stripped by `SentinelFilter`, which holds back a short tail so
+   a sentinel split across two deltas is still caught without breaking streaming.
 3. **Adapter has no auth.** It holds the gateway token and accepts any caller. Loopback +
    docker bridge only for now.
 4. **Artifact ingest, when built, must not be keyed on session id alone** — that is
@@ -343,8 +350,10 @@ Add a systemd unit before relying on this.
 
 1. Delete `agentResponseParser.ts`'s full-payload parsing; shrink to the `vss_artifact`
    reference marker. Update `vss-search-archive` to emit it.
-2. Build `GET /v1/skills/bundle.tar.gz` + `GET /v1/skills/env` — needed by both the POC
-   and the real version, same code either way.
+2. ~~Build `GET /v1/skills/bundle.tar.gz` + `GET /v1/skills/env`~~ — **done** (in the
+   adapter; move into VSS proper when the contract firms up). Also serves `GET /v1/skills`
+   as a manifest with a per-skill `requirements` list, so a harness lacking a shell can
+   tell up front that it cannot run them.
 3. Decide multi-user isolation (§2.10) before more UI work.
 4. Write the contract spec as a reviewable doc so a BYO integrator has something to build
    against.

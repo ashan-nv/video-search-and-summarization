@@ -16,6 +16,9 @@ notes are in **[DECISIONS.md](DECISIONS.md)** — read that before changing anyt
 |---|---|---|
 | `POST` | `/chat/stream` | OpenAI-shaped `{messages}` in, `text/event-stream` out |
 | `GET` | `/health` | liveness + resolved gateway/session config |
+| `GET` | `/v1/skills` | manifest: name, path, `requirements` per skill |
+| `GET` | `/v1/skills/bundle.tar.gz` | all skills, version-matched to this deployment |
+| `GET` | `/v1/skills/env` | resolved VSS base URLs (replaces `HOST_IP` guessing) |
 
 The request/response shape is not invented — it is what the VSS UI already speaks
 (`packages/nemo-agent-toolkit-ui/pages/api/chat.ts`). Any backend implementing
@@ -36,6 +39,8 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 | `OPENCLAW_SESSION_PREFIX` | `agent:main:vss` | one session per UI conversation |
 | `ADAPTER_PORT` | `9099` | |
 | `ADAPTER_TURN_TIMEOUT` | `600` | seconds |
+| `VSS_SKILLS_DIR` | `~/video-search-and-summarization/skills` | source for the skills endpoints |
+| `VSS_HOST_ALIAS` | `host.openshell.internal` | advertised by `/v1/skills/env` |
 
 Requires `websocket-client` (`pip install websocket-client`).
 
