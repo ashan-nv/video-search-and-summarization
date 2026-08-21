@@ -198,9 +198,27 @@ Two consequences:
    jq]` inline, it correctly reported `uv`, `vss-repo`, and `docker` missing while noting
    `curl` and `jq` present.
 
-Detection is text-based, so it is a hint rather than a contract — some mentions are
-fallbacks or prohibitions ("do not run docker directly"). Still far better than a uniform
-claim. A future `requirements:` block in SKILL.md frontmatter would make it exact.
+**Then this over-corrected, and the over-correction was worse.** Reporting every mentioned
+tool as required made the agent conclude that **none** of the 18 skills could run — minutes
+after it had successfully used one to list video sources. Two reasons that was wrong:
+
+- `docker` is mentioned by 17 of 18 skills, but usually as one discovery path among
+  several (`docker inspect` for env) or as a *prohibition* ("never run docker directly,
+  call the orchestrator MCP"). Its absence rarely blocks anything.
+- `mcp` is not a binary. It is a protocol reached over HTTP, so "mcp is missing" is a
+  category error.
+
+The uniform list was misleading; the exhaustive list produced confident **false
+negatives**, which is worse — it stopped the agent attempting things that work.
+
+Now only verified blockers are reported: `uv` and `vss-repo`, which genuinely prevent the
+search CLI from being built or run. That flags 5 of 18 skills; the other 13 carry no tag
+and the agent is told to just try them, and never to declare a skill unrunnable without
+attempting it. Verified: the same question now returns 13 runnable and 5 blocked with
+accurate reasons.
+
+Detection remains text-based and therefore a hint. A `requirements:` block in SKILL.md
+frontmatter would make it exact — see 7.6.
 
 ### 2.8d Archive search over HTTP
 

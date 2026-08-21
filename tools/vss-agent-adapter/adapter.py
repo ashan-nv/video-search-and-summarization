@@ -73,33 +73,35 @@ SENTINELS = ("NO_REPLY", "HEARTBEAT_OK")
 _HOLD = max(len(x) for x in SENTINELS) - 1
 
 
-# What a skill's SKILL.md has to mention for us to claim it needs that tool.
-# Audited against the 18 VSS skills: 17 reference docker, 5 need uv, 3 need a
-# repo checkout. A sandboxed agent typically has curl/jq/python3 but NOT docker
-# or uv, so advertising a uniform requirement set is actively misleading.
-_REQUIREMENT_PATTERNS = [
+# Only tools whose absence genuinely blocks a skill are reported as blocking.
+#
+# Learned by observation: an earlier version reported every mentioned tool as
+# required, and the agent concluded NONE of the 18 skills could run -- minutes
+# after it had successfully used one. Two reasons that was wrong:
+#
+#   * `docker` is mentioned by 17 of 18 skills, but usually as one discovery
+#     path among several (`docker inspect` for env) or as a *prohibition*
+#     ("never run docker directly, call the orchestrator MCP"). Its absence
+#     rarely blocks anything.
+#   * `mcp` is not a binary at all. It is a protocol reached over HTTP, so
+#     "mcp is missing" is a category error.
+#
+# uv and vss-repo are different: without them the search CLI cannot be built or
+# run at all. Those are the only verified blockers.
+_BLOCKING_PATTERNS = [
     ("uv", re.compile(r"(?:^|[^a-z])uv (?:run|tool)|uvx ", re.M)),
     ("vss-repo", re.compile(r"VSS_REPO_ROOT|services/agent")),
-    ("docker", re.compile(r"(?:^|[^a-z-])docker ")),
-    ("curl", re.compile(r"\bcurl\b")),
-    ("jq", re.compile(r"\bjq\b")),
-    ("mcp", re.compile(r"mcp", re.I)),
 ]
 
 
 def _detect_requirements(skill_md):
-    """Best-effort: what a skill's instructions actually reach for.
-
-    Derived from the text, so it is a hint rather than a contract -- some
-    mentions are fallbacks or prohibitions ("do not run docker directly").
-    Still far better than claiming every skill needs the same three things.
-    """
+    """Tools whose absence actually blocks this skill. Usually empty."""
     try:
         with open(skill_md, encoding="utf-8", errors="replace") as fh:
             body = fh.read()
     except OSError:
         return []
-    return [name for name, pat in _REQUIREMENT_PATTERNS if pat.search(body)]
+    return [name for name, pat in _BLOCKING_PATTERNS if pat.search(body)]
 
 
 def _frontmatter_description(skill_md):
@@ -193,13 +195,12 @@ def build_bootstrap(manifest, base_url):
         "",
     ]
     for e in manifest:
-        # Requirements go next to the name, not in a footnote: the agent picks a
-        # skill from this list, so it has to see the cost at selection time.
-        # Without this it refuses for plausible-but-wrong reasons.
-        needs = ", ".join(e.get("requirements") or []) or "none"
+        # Annotate only genuine blockers. Listing every mentioned tool made the
+        # agent pre-refuse skills it could actually run.
+        blockers = e.get("requirements") or []
+        tag = f" [requires: {', '.join(blockers)}]" if blockers else ""
         lines.append(
-            f"- {e['name']} [needs: {needs}]: "
-            f"{e.get('description') or '(no description)'}")
+            f"- {e['name']}{tag}: {e.get('description') or '(no description)'}")
     lines += [
         "",
         "## Archive search over HTTP",
@@ -211,11 +212,13 @@ def build_bootstrap(manifest, base_url):
         "it runs the same command host-side. Present hits as prose, not raw JSON.",
         "",
         "## Conventions",
-        "- Each skill lists what it needs. Before using one, verify those tools",
-        "  exist (`command -v <tool>`). If something is missing, say exactly which",
-        "  tool is absent -- do not blame an unrelated service.",
-        "- `vss-repo` means the skill needs a VSS source checkout and its CLI; that",
-        "  is usually absent in a sandbox, and no amount of network access fixes it.",
+        "- A `[requires: ...]` tag means that skill genuinely cannot run without",
+        "  those tools. `vss-repo` means a VSS source checkout plus its CLI, which a",
+        "  sandbox will not have and no amount of network access fixes.",
+        "- Skills with no tag: just try them. Most work with curl and jq against the",
+        "  VSS HTTP APIs. A skill mentioning `docker` usually offers an HTTP path too,",
+        "  or is telling you NOT to use docker directly -- do not treat a mention as a",
+        "  blocker, and never report a skill unrunnable without actually attempting it.",
         "- Deployment/teardown goes through the VSS Orchestrator MCP, never raw",
         "  `docker compose` or host shell commands. That MCP runs on the host, so",
         "  you do not need local docker to deploy.",
