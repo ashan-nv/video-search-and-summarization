@@ -220,6 +220,19 @@ accurate reasons.
 Detection remains text-based and therefore a hint. A `requirements:` block in SKILL.md
 frontmatter would make it exact — see 7.6.
 
+**A third distinction was still missing: tools vs services.** With blockers corrected, the
+agent listed `vss-manage-alerts` and the `vss-deploy-*` skills as runnable — true of the
+*skill*, but alert-bridge, VA-MCP and the orchestrator MCP are not deployed on a search
+profile, so it was planning against services that are not there.
+
+`/v1/skills/env` now probes each service and reports `reachable`, and the bootstrap carries
+a live "available / NOT deployed" line. The agent now answers in three tiers: usable now,
+usable-but-backend-missing (naming the absent service), and blocked on tools. Reachability
+is cached for 30s so it costs nothing per turn.
+
+Related wording fix: the bootstrap described the adapter's base URL as "VSS agent APIs",
+and the agent duly called `:9098` "the VSS agent". It is the adapter; the text now says so.
+
 ### 2.8d Archive search over HTTP
 
 **Decided:** the adapter exposes `POST /v1/search`, which runs the same host CLI

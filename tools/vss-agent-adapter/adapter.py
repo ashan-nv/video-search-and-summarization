@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import io, ipaddress, json, os, queue, re, shutil, subprocess, tarfile, threading, uuid
+import io, ipaddress, json, os, queue, re, shutil, socket, subprocess, tarfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -182,8 +182,9 @@ def build_bootstrap(manifest, base_url):
         "deployment. The user is talking to you from the VSS UI.",
         "",
         "## Reaching VSS",
-        f"Base URL for VSS agent APIs: {base_url}",
-        f"Resolved service endpoints: GET {base_url}/v1/skills/env",
+        f"{base_url} is the VSS agent adapter -- not a VSS backend service. It",
+        "serves your skills, the resolved endpoint list, and archive search.",
+        f"Resolved service endpoints and their live status: GET {base_url}/v1/skills/env",
         "Inside a sandbox, always call the host alias from that document -- never",
         "`localhost` and never a literal IP, or the egress policy denies the call.",
         "",
@@ -211,6 +212,12 @@ def build_bootstrap(manifest, base_url):
         "Use this instead of the `vss` CLI when uv or a repo checkout is absent;",
         "it runs the same command host-side. Present hits as prose, not raw JSON.",
         "",
+        "## Services currently deployed",
+        "Not every VSS service is running on every profile. Right now:",
+        "__SERVICE_STATUS__",
+        "A skill whose backend is down is not broken -- the service simply is not",
+        "deployed here. Say which service is missing rather than blaming the skill.",
+        "",
         "## Conventions",
         "- A `[requires: ...]` tag means that skill genuinely cannot run without",
         "  those tools. `vss-repo` means a VSS source checkout plus its CLI, which a",
@@ -229,7 +236,12 @@ def build_bootstrap(manifest, base_url):
         "---",
         "",
     ]
-    return "\n".join(lines)
+    reach = service_reachability()
+    up = sorted(n for n, ok in reach.items() if ok)
+    down = sorted(n for n, ok in reach.items() if not ok)
+    status = (f"  available: {', '.join(up) or 'none'}\n"
+              f"  NOT deployed: {', '.join(down) or 'none'}")
+    return "\n".join(lines).replace("__SERVICE_STATUS__", status)
 
 
 class SentinelFilter:
@@ -260,6 +272,40 @@ class SentinelFilter:
         for token in SENTINELS:
             text = text.replace(token, "")
         return text
+
+
+# VSS services an agent may need, and the host port each listens on. Probed
+# live because "the skill can run" and "its backend is deployed" are different
+# questions -- a search-profile deployment has no alert-bridge or VA-MCP, and
+# an agent told only about tools will confidently plan against services that
+# are not there.
+VSS_SERVICES = {
+    "vss_agent": 8000,
+    "orchestrator_mcp": 9988,
+    "va_mcp": 9901,
+    "alert_bridge": 9080,
+    "elasticsearch": 9200,
+    "vst_vios": 30888,
+    "rt_vlm": 8018,
+}
+_REACH_CACHE = {"at": 0.0, "data": None}
+_REACH_TTL = 30.0
+
+
+def service_reachability():
+    """{name: bool} for VSS services, cached briefly."""
+    now = time.monotonic()
+    if _REACH_CACHE["data"] is not None and now - _REACH_CACHE["at"] < _REACH_TTL:
+        return _REACH_CACHE["data"]
+    out = {}
+    for name, port in VSS_SERVICES.items():
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.5):
+                out[name] = True
+        except OSError:
+            out[name] = False
+    _REACH_CACHE.update(at=now, data=out)
+    return out
 
 
 def _query_param(path, key):
@@ -503,6 +549,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/skills/env":
+            reach = service_reachability()
             # Where VSS actually is, so a BYO agent does not have to re-derive
             # host resolution from prose in deployment_resolution.md / ENV.md.
             self._json({
@@ -510,15 +557,12 @@ class Handler(BaseHTTPRequestHandler):
                 "note": "In-sandbox only. Never use localhost or a literal IP; "
                         "the egress policy whitelists this alias on fixed ports.",
                 "services": {
-                    "vss_agent": f"http://{HOST_ALIAS}:8000",
-                    "orchestrator_mcp": f"http://{HOST_ALIAS}:9988/mcp",
-                    "va_mcp": f"http://{HOST_ALIAS}:9901",
-                    "alert_bridge": f"http://{HOST_ALIAS}:9080",
-                    "elasticsearch": f"http://{HOST_ALIAS}:9200",
-                    "vst_vios": f"http://{HOST_ALIAS}:30888",
-                    "rt_vlm": f"http://{HOST_ALIAS}:8018",
-                    "archive_search": f"{ADAPTER_PUBLIC_URL}/v1/search",
+                    name: {"url": f"http://{HOST_ALIAS}:{port}",
+                           "reachable": reach.get(name, False)}
+                    for name, port in VSS_SERVICES.items()
                 },
+                "archive_search": {"url": f"{ADAPTER_PUBLIC_URL}/v1/search",
+                                   "reachable": True},
             })
             return
 
