@@ -168,6 +168,29 @@ bootstrap turn makes the agent reply to it, surfacing a stray message to the use
 Verified: on a fresh session, asked which skill searches archived video, the agent
 answered `vss-search-archive` — information it could only have from the injected index.
 
+**Two skill paths coexist on this deployment, and only one of them is the BYO one.**
+
+| | Path 1 — OpenClaw native | Path 2 — adapter |
+|---|---|---|
+| Index | OpenClaw scans `/sandbox/.openclaw/skills/` and injects `<available_skills>` XML into the system prompt | adapter walks `VSS_SKILLS_DIR` and prepends an index to the first user turn |
+| Body | `read` a local file | `GET /v1/skills/<name>` |
+| Requires | `skill install` into an OpenClaw-shaped workspace | nothing but HTTP |
+
+Neither is hardcoded; both are built by scanning the filesystem. The adapter's index is
+generated at process start and cached for the process lifetime, so adding a skill needs an
+adapter restart.
+
+Because both are active, **Path 2 went unexercised for most of this work** — the agent
+always had a local copy, so the adapter logged zero `GET /v1/skills/<name>` requests
+despite the index telling it to fetch. Verified properly by moving
+`vss-manage-video-io-storage` out of the sandbox and re-asking: the sandbox fetched
+`GET /v1/skills/vss-manage-video-io-storage` over HTTP and completed the task with real
+data. Path 2 works; it just needs the local copy absent to be reached, which is exactly
+the BYO case.
+
+Worth remembering when interpreting any "the agent used a skill" result on this box: a
+local install can mask a broken remote path.
+
 ### 2.8c Skill requirements are real, and most VSS skills are host-oriented
 
 Audit of the 18 skills, by what their `SKILL.md` actually reaches for:
