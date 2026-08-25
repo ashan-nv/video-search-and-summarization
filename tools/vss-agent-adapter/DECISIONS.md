@@ -367,8 +367,30 @@ Both harnesses are wired into the UI simultaneously: Hermes on the chat tab
 (`NEXT_PUBLIC_HTTP_CHAT_COMPLETION_URL` → :9097, titled "Hermes Agent"), OpenClaw on the
 sidebar (:9098, "NemoClaw Agent", light theme). One URL each; no code.
 
+**The injected index competes with the harness's own skill registry.** Asked "what skills
+do you have", Hermes answered from its native registry — 69 skills across categories like
+`github`, `mlops`, `creative` — and never mentioned the 18 VSS ones, despite having read
+the bootstrap (its opening message correctly named the adapter URL and the live service
+list). OpenClaw did not show this, because its own index and the injected one merge into
+the same prompt; Hermes has a first-class `skill_view` tool backed by a registry, so the
+question resolves there.
+
+Fixed in the bootstrap wording: the section is now "VSS skills available to you", states
+they are separate from the harness's built-in skills, and says to answer VSS questions
+from that list. Verified: Hermes now lists all 18. Generalises — any harness with its own
+skill system will need this disambiguation, so it belongs in the contract, not in a
+per-harness driver.
+
+**Hermes wrote its own skill.** It is a self-improving agent, and after using
+`POST /v1/search` it authored and persisted
+`/sandbox/.hermes/skills/vss-video-search/SKILL.md` — category `media`, describing the
+adapter's archive-search endpoint. Nothing asked it to. Worth knowing for two reasons: a
+self-improving harness will bake deployment specifics (like an adapter URL) into durable
+state, which goes stale when the deployment moves; and it is evidence the bootstrap is
+being genuinely absorbed rather than skimmed.
+
 Minor observations: Hermes once guessed `GET /v1/<skill-name>` without the `/skills/`
-segment, took the 404 and recovered — the bootstrap could state the path template more
+segment, took the 404 and recovered — the bootstrap now states the path template
 explicitly. And a broad open-ended search prompt ran past 270s while it explored, where a
 direct instruction completed in 7s.
 
