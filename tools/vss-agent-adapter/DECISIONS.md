@@ -375,10 +375,29 @@ list). OpenClaw did not show this, because its own index and the injected one me
 the same prompt; Hermes has a first-class `skill_view` tool backed by a registry, so the
 question resolves there.
 
-Fixed in the bootstrap wording: the section is now "VSS skills available to you", states
-they are separate from the harness's built-in skills, and says to answer VSS questions
-from that list. Verified: Hermes now lists all 18. Generalises — any harness with its own
-skill system will need this disambiguation, so it belongs in the contract, not in a
+Fixed in the bootstrap wording — but the first attempt at that fix **broke skill usage**,
+which is worth recording because the failure is entirely about ordering.
+
+That version led the section with a paragraph of meta-framing ("these are SEPARATE from
+your harness's skills; answer from THIS list, not your registry") and pushed the action
+instruction below it. Hermes then answered "list them" correctly and stopped *using*
+skills: asked to list video sources it searched local config files and `/dev/video*`,
+concluded the sandbox had no video hardware, and never fetched a skill or called VST. The
+adapter logged only `/chat/stream` for that turn.
+
+Leading with instructions about how to *talk about* the list made the model treat it as
+reference material rather than a call to act. The working version puts the action first —
+"When a request relates to VSS, pick the matching skill below, FETCH its instructions, and
+follow them" — and demotes the disambiguation to a closing parenthetical. It also states
+explicitly not to go looking through the filesystem, config files or `/dev` for VSS state,
+since VSS data lives in services, which is the specific wrong turn that was observed.
+
+Verified both behaviours after the reorder: "what VSS skills are available" lists all 18
+with their `[requires: …]` tags, and "list the video sources with their sensor IDs" fetches
+`vss-manage-video-io-storage` plus `/v1/skills/env` and returns the real sensors.
+
+Generalises — any harness with its own skill system needs the disambiguation, and any
+bootstrap needs the action ahead of the meta. Both belong in the contract, not in a
 per-harness driver.
 
 **Hermes wrote its own skill.** It is a self-improving agent, and after using
