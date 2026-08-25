@@ -346,9 +346,31 @@ on different ports. Verified: asked which skill searches archived video, Hermes 
 `vss-search-archive` — obtainable only from the injected index, so bootstrap, skills
 discovery and streaming all work on the second harness.
 
-Not yet exercised on Hermes: fetching a skill body over HTTP, and `/v1/search`. The
-sandbox has its own egress policy, so port 9098/9097 will need adding there as it did for
-`demo` (2.8d).
+**Full parity reached.** After adding port 9097 to the policy and applying it to the
+`hermes` sandbox, Hermes exercises every path OpenClaw does — and on cleaner evidence,
+because the hermes sandbox has **zero skills installed**, so nothing local can mask a
+broken remote path:
+
+```
+172.20.0.3  GET  /v1/skills/vss-manage-video-io-storage  200
+172.20.0.3  GET  /v1/skills/vss-search-archive           200
+172.20.0.3  GET  /v1/skills/env                          200
+172.20.0.3  POST /v1/search                              200
+```
+
+It listed the real registered sensors, and returned the same
+`{"data": [], "search_messages": []}` from a populated index that OpenClaw does —
+reproducing the retrieval bug (2.8e) independently on a second harness, which is further
+evidence it is a VSS issue rather than anything adapter-side.
+
+Both harnesses are wired into the UI simultaneously: Hermes on the chat tab
+(`NEXT_PUBLIC_HTTP_CHAT_COMPLETION_URL` → :9097, titled "Hermes Agent"), OpenClaw on the
+sidebar (:9098, "NemoClaw Agent", light theme). One URL each; no code.
+
+Minor observations: Hermes once guessed `GET /v1/<skill-name>` without the `/skills/`
+segment, took the 404 and recovered — the bootstrap could state the path template more
+explicitly. And a broad open-ended search prompt ran past 270s while it explored, where a
+direct instruction completed in 7s.
 
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
