@@ -15,7 +15,7 @@ Gateway protocol notes (discovered empirically against OpenClaw 2026.6.10):
   - sessions.messages.subscribe takes {"key": ...}, chat.send takes
     {"sessionKey", "message", "idempotencyKey"}
 """
-import io, ipaddress, json, os, queue, re, shutil, socket, subprocess, tarfile, threading, time, uuid
+import io, ipaddress, json, os, queue, re, shutil, socket, subprocess, tarfile, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
@@ -32,6 +32,15 @@ HOST_ALIAS = os.environ.get("VSS_HOST_ALIAS", "host.openshell.internal")
 # Harness sentinels that must never reach a user. OpenClaw emits these for
 # heartbeat turns; they are exact tokens, unlike the model's chain-of-thought
 # which arrives as ordinary prose and is NOT safely strippable.
+# Which harness this adapter drives. "openclaw" speaks a WebSocket gateway and
+# needs real translation; "hermes" already exposes an OpenAI-compatible API, so
+# its driver is mostly a passthrough that adds auth and the bootstrap.
+AGENT_BACKEND = os.environ.get("AGENT_BACKEND", "openclaw").strip().lower()
+HERMES_API_URL = os.environ.get(
+    "HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions")
+HERMES_TOKEN = os.environ.get("HERMES_TOKEN", "").strip()
+HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
+
 BOOTSTRAP_ENABLED = os.environ.get("ADAPTER_BOOTSTRAP", "1") != "0"
 ADAPTER_PUBLIC_URL = os.environ.get(
     "ADAPTER_PUBLIC_URL", f"http://{HOST_ALIAS}:{os.environ.get('ADAPTER_PORT', '9099')}")
@@ -381,6 +390,62 @@ BOOTSTRAPPED = set()
 _BOOTSTRAP_LOCK = threading.Lock()
 
 
+def _first_turn(session_key):
+    with _BOOTSTRAP_LOCK:
+        first = session_key not in BOOTSTRAPPED
+        BOOTSTRAPPED.add(session_key)
+    return first and BOOTSTRAP_ENABLED
+
+
+def run_turn_hermes(message, session_key, out):
+    """Drive Hermes, which already speaks OpenAI-compatible streaming chat.
+
+    Almost a passthrough: attach the bearer token, prepend the bootstrap on a
+    session's first turn, and re-emit content deltas through the sentinel
+    filter. The frames Hermes produces are already the shape the VSS UI parses,
+    which is the clearest evidence that the OpenAI-shaped contract (2.2) was
+    the right choice -- a different harness arrived at it independently.
+    """
+    if _first_turn(session_key):
+        message = BOOTSTRAP_TEXT() + message
+    body = json.dumps({
+        "model": HERMES_MODEL,
+        "messages": [{"role": "user", "content": message}],
+        "stream": True,
+    }).encode()
+    req = urllib.request.Request(HERMES_API_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if HERMES_TOKEN:
+        req.add_header("Authorization", f"Bearer {HERMES_TOKEN}")
+    sentinels = SentinelFilter()
+    try:
+        with urllib.request.urlopen(req, timeout=TURN_TIMEOUT) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(payload)["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                clean = sentinels.feed(delta.get("content") or "")
+                if clean:
+                    out.put(sse(json.dumps(
+                        {"choices": [{"delta": {"content": clean}}]})))
+        tail = sentinels.flush()
+        if tail:
+            out.put(sse(json.dumps({"choices": [{"delta": {"content": tail}}]})))
+    except Exception as exc:  # noqa: BLE001 - POC: surface everything to the UI
+        out.put(sse(json.dumps({"choices": [{"delta": {
+            "content": f"\n[adapter/hermes] {type(exc).__name__}: {exc}"}}]})))
+    finally:
+        out.put(sse("[DONE]"))
+        out.put(None)
+
+
 def run_turn(message: str, session_key: str, out: queue.Queue):
     """Drive one agent turn, pushing SSE-ready strings onto `out`."""
     ws = None
@@ -421,10 +486,7 @@ def run_turn(message: str, session_key: str, out: queue.Queue):
         # Prepend deployment context on a session's first turn only. Sending it
         # as its own turn would make the agent reply to it and surface a stray
         # message to the user.
-        with _BOOTSTRAP_LOCK:
-            first_turn = session_key not in BOOTSTRAPPED
-            BOOTSTRAPPED.add(session_key)
-        if first_turn and BOOTSTRAP_ENABLED:
+        if _first_turn(session_key):
             message = BOOTSTRAP_TEXT() + message
 
         req("chat.send", {"sessionKey": session_key, "message": message,
@@ -610,7 +672,7 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/health":
             self.send_error(404)
             return
-        self._json({"ok": True, "gateway": GATEWAY_URL,
+        self._json({"ok": True, "backend": AGENT_BACKEND, "gateway": GATEWAY_URL,
                     "sessionPrefix": SESSION_PREFIX,
                     "skills": len(self._skills_manifest())})
 
@@ -662,8 +724,9 @@ class Handler(BaseHTTPRequestHandler):
                 or body.get("conversation_id"))
         session_key = f"{SESSION_PREFIX}-{conv or uuid.uuid4().hex[:12]}"
 
+        driver = run_turn_hermes if AGENT_BACKEND == "hermes" else run_turn
         out: queue.Queue = queue.Queue()
-        threading.Thread(target=run_turn, args=(user, session_key, out),
+        threading.Thread(target=driver, args=(user, session_key, out),
                          daemon=True).start()
         while True:
             try:

@@ -319,6 +319,37 @@ is behind HTTP basic auth. Browsers authenticate once and cache; **programmatic 
 (`http://localhost:7777`). Exempting the upload path from auth would let anyone upload
 video to the deployment, so the auth stays and callers adapt.
 
+### 2.8f Hermes: second harness, ~60 lines of driver
+
+**The BYO claim is now demonstrated with a second, independent harness.**
+
+`nemoclaw agents list` offers three runtimes: `openclaw`, `hermes` (Nous Research), and
+`langchain-deepagents-code`. Onboarding Hermes alongside the existing sandbox took one
+command — `nemoclaw onboard --agent hermes --control-ui-port 18790` with
+`NEMOCLAW_SANDBOX_NAME=hermes`. Both sandboxes coexist; nothing about `demo` changed.
+
+**Hermes already exposes an OpenAI-compatible API** on `:8642/v1` with bearer auth, and
+its stream is standard `chat.completion.chunk` frames with `choices[0].delta.content`
+terminated by `[DONE]` — byte-for-byte the shape `chat.ts` parses.
+
+That is the strongest available evidence that 2.2 was right. The contract was not designed
+for portability; it was adopted because the VSS UI already spoke it. A harness built by a
+different organisation arrived at the same shape independently.
+
+Consequence: the Hermes driver is ~60 lines and mostly passthrough — attach the bearer,
+prepend the bootstrap on a session's first turn, re-emit content deltas through the
+sentinel filter. Compare the OpenClaw driver, which implements a WebSocket handshake,
+scopes, session creation and event translation.
+
+Selected with `AGENT_BACKEND=hermes` plus `HERMES_TOKEN`; both instances can run at once
+on different ports. Verified: asked which skill searches archived video, Hermes answered
+`vss-search-archive` — obtainable only from the injected index, so bootstrap, skills
+discovery and streaming all work on the second harness.
+
+Not yet exercised on Hermes: fetching a skill body over HTTP, and `/v1/search`. The
+sandbox has its own egress policy, so port 9098/9097 will need adding there as it did for
+`demo` (2.8d).
+
 ### 2.9 BYO scope: "their harness, our sandbox" — not "their sandbox"
 
 **Decided:** support Case A. Defer Case B.

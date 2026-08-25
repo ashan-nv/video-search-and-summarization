@@ -52,6 +52,19 @@ OPENCLAW_GATEWAY_TOKEN="$(nemoclaw <sandbox> gateway-token | head -1)" \
 | `ADAPTER_ALLOW_CIDRS` | `127.0.0.1/32,::1/128,172.16.0.0/12` | callers allowed to reach the adapter |
 | `ADAPTER_TOKEN` | *(unset)* | if set, required via `Authorization: Bearer`, `X-Adapter-Token`, or `?token=` |
 | `ADAPTER_SSE_KEEPALIVE` | `15` | seconds between SSE keepalive comments |
+| `AGENT_BACKEND` | `openclaw` | `openclaw` (WebSocket gateway) or `hermes` (OpenAI-compatible API) |
+| `HERMES_API_URL` | `http://127.0.0.1:8642/v1/chat/completions` | Hermes agent API |
+| `HERMES_TOKEN` | *(unset)* | `nemoclaw <sandbox> gateway-token --quiet` |
+| `HERMES_MODEL` | `hermes-agent` | |
+
+## Harnesses
+
+`AGENT_BACKEND=openclaw` drives OpenClaw's WebSocket gateway — handshake, scopes, session
+creation, event translation.
+
+`AGENT_BACKEND=hermes` drives Hermes, which already exposes an OpenAI-compatible API on
+`:8642/v1`. That driver is ~60 lines and mostly passthrough: attach the bearer, prepend the
+bootstrap, re-emit deltas. Both can run at once on different ports.
 
 ## Access control
 
