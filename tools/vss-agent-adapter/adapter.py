@@ -40,6 +40,12 @@ HERMES_API_URL = os.environ.get(
     "HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions")
 HERMES_TOKEN = os.environ.get("HERMES_TOKEN", "").strip()
 HERMES_MODEL = os.environ.get("HERMES_MODEL", "hermes-agent")
+# OpenClaw's OpenAI Responses endpoint, off by default and enabled with
+# gateway.http.endpoints.responses.enabled. Speaking this instead of the
+# WebSocket gateway is what lets one HTTP driver serve both harnesses.
+OPENCLAW_HTTP_URL = os.environ.get(
+    "OPENCLAW_HTTP_URL", "http://localhost:18789/v1/responses")
+OPENCLAW_HTTP_MODEL = os.environ.get("OPENCLAW_HTTP_MODEL", "openclaw")
 
 BOOTSTRAP_ENABLED = os.environ.get("ADAPTER_BOOTSTRAP", "1") != "0"
 ADAPTER_PUBLIC_URL = os.environ.get(
@@ -454,6 +460,54 @@ BOOTSTRAPPED = set()
 _BOOTSTRAP_LOCK = threading.Lock()
 
 
+def run_turn_openclaw_http(message, session_key, out):
+    """Drive OpenClaw through its OpenAI Responses endpoint.
+
+    The same job as run_turn's ~200 lines of WebSocket handshake, scopes,
+    session creation and event translation -- in about forty, because the
+    protocol work disappears when the harness speaks HTTP.
+
+    Tradeoff: this stream carries text only. The WebSocket path also yields
+    `agent` tool events, which is what populates the intermediate-steps panel,
+    so switching to HTTP buys simplicity and loses step visibility.
+    """
+    if _first_turn(session_key):
+        message = BOOTSTRAP_TEXT() + message
+    body = json.dumps({"model": OPENCLAW_HTTP_MODEL, "input": message,
+                       "stream": True}).encode()
+    req = urllib.request.Request(OPENCLAW_HTTP_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if GATEWAY_TOKEN:
+        req.add_header("Authorization", f"Bearer {GATEWAY_TOKEN}")
+    sentinels = SentinelFilter()
+    try:
+        with urllib.request.urlopen(req, timeout=TURN_TIMEOUT) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    frame = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if frame.get("type") == "response.output_text.delta":
+                    clean = sentinels.feed(frame.get("delta") or "")
+                    if clean:
+                        out.put(sse(json.dumps(
+                            {"choices": [{"delta": {"content": clean}}]})))
+                elif frame.get("type") in ("response.completed", "response.failed"):
+                    break
+        tail = sentinels.flush()
+        if tail:
+            out.put(sse(json.dumps({"choices": [{"delta": {"content": tail}}]})))
+    except Exception as exc:  # noqa: BLE001 - POC: surface everything to the UI
+        out.put(sse(json.dumps({"choices": [{"delta": {
+            "content": f"\n[adapter/openclaw-http] {type(exc).__name__}: {exc}"}}]})))
+    finally:
+        out.put(sse("[DONE]"))
+        out.put(None)
+
+
 def _first_turn(session_key):
     with _BOOTSTRAP_LOCK:
         first = session_key not in BOOTSTRAPPED
@@ -824,7 +878,10 @@ class Handler(BaseHTTPRequestHandler):
                 or body.get("conversation_id"))
         session_key = f"{SESSION_PREFIX}-{conv or uuid.uuid4().hex[:12]}"
 
-        driver = run_turn_hermes if AGENT_BACKEND == "hermes" else run_turn
+        driver = {
+            "hermes": run_turn_hermes,
+            "openclaw-http": run_turn_openclaw_http,
+        }.get(AGENT_BACKEND, run_turn)
         out: queue.Queue = queue.Queue()
         threading.Thread(target=driver, args=(user, session_key, out),
                          daemon=True).start()
