@@ -56,6 +56,7 @@ VSS_REPO_ROOT = os.environ.get(
     "VSS_REPO_ROOT", os.path.expanduser("~/video-search-and-summarization"))
 UV_BIN = os.environ.get("UV_BIN") or shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
 SEARCH_MODES = ("embed", "attribute", "fusion", "object")
+VSS_INGRESS = os.environ.get("VSS_INGRESS_ORIGIN", "http://127.0.0.1:7777").rstrip("/")
 SEARCH_TIMEOUT = int(os.environ.get("ADAPTER_SEARCH_TIMEOUT", "180"))
 
 # --- access control -------------------------------------------------------
@@ -339,6 +340,35 @@ def sse(data: str) -> bytes:
     return f"data: {data}\n\n".encode()
 
 
+def _empty_result_diagnostics():
+    """Explain an empty result set: no matches, or nothing indexed at all."""
+    info = {
+        "retrieval_returned": "no hits",
+        "retry_guidance": (
+            "Do NOT retry with different parameters. An empty result from this "
+            "endpoint means retrieval found nothing, not that the request was "
+            "malformed. Report the outcome to the user."
+        ),
+    }
+    try:
+        req = urllib.request.Request(
+            f"{VSS_INGRESS}/elasticsearch/_cat/indices/mdx-*?h=index,docs.count&format=json")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            indices = json.load(resp)
+        total = sum(int(i.get("docs.count") or 0) for i in indices)
+        info["indices"] = [i.get("index") for i in indices]
+        info["indexed_documents"] = total
+        info["likely_cause"] = (
+            "nothing has been ingested yet — ingest a video before searching"
+            if total == 0 else
+            "documents are indexed but none matched; this deployment has a known "
+            "retrieval issue where valid queries return zero hits"
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never fail the call
+        info["index_check_failed"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
 def run_search(body):
     """Invoke `vss search run <mode> --raw` and return its SearchOutput.
 
@@ -389,10 +419,18 @@ def run_search(body):
     if start == -1:
         return 502, {"error": "no JSON in search output", "stdout": out[-500:]}
     try:
-        return 200, json.loads(out[start:])
+        payload = json.loads(out[start:])
     except json.JSONDecodeError as exc:
         return 502, {"error": f"unparseable search output: {exc}",
                      "stdout": out[-500:]}
+
+    # A bare {"data": [], "search_messages": []} is indistinguishable from
+    # "you called it wrong", and an agent given that will retry with different
+    # parameters indefinitely -- observed doing 66 tool calls and never
+    # answering. Say what is actually known so it can stop.
+    if isinstance(payload, dict) and not payload.get("data"):
+        payload["diagnostics"] = _empty_result_diagnostics()
+    return 200, payload
 
 
 BOOTSTRAPPED = set()
