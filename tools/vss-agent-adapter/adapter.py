@@ -340,6 +340,14 @@ def sse(data: str) -> bytes:
     return f"data: {data}\n\n".encode()
 
 
+# Most recent successful search, so the UI can render hits without the model
+# transcribing them into chat text (2.5). The agent's own HTTP call carries no
+# conversation id, so this is a single most-recent slot rather than per-session:
+# fine for a single-user POC, and the staleness window keeps it honest.
+_LAST_SEARCH: dict = {"at": 0.0, "query": None, "payload": None}
+_LAST_SEARCH_TTL = 180.0
+
+
 def _empty_result_diagnostics():
     """Explain an empty result set: no matches, or nothing indexed at all."""
     info = {
@@ -437,6 +445,8 @@ def run_search(body):
     # the reader) chasing an imaginary bug.
     if isinstance(payload, dict) and not payload.get("data"):
         payload["diagnostics"] = _empty_result_diagnostics()
+    elif isinstance(payload, dict):
+        _LAST_SEARCH.update(at=time.monotonic(), query=query, payload=payload)
     return 200, payload
 
 
@@ -662,6 +672,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/skills":
             self._json({"count": len(self._skills_manifest()),
                         "skills": self._skills_manifest()})
+            return
+
+        if path == "/v1/search/last":
+            fresh = time.monotonic() - _LAST_SEARCH["at"] < _LAST_SEARCH_TTL
+            if fresh and _LAST_SEARCH["payload"]:
+                self._json({"query": _LAST_SEARCH["query"],
+                            **_LAST_SEARCH["payload"]})
+            else:
+                self._json({"data": [], "stale": True})
             return
 
         if path == "/v1/skills/env":
