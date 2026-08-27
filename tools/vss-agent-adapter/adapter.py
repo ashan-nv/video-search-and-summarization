@@ -482,6 +482,7 @@ def run_turn_hermes(message, session_key, out):
     if HERMES_TOKEN:
         req.add_header("Authorization", f"Bearer {HERMES_TOKEN}")
     sentinels = SentinelFilter()
+    step = 0
     try:
         with urllib.request.urlopen(req, timeout=TURN_TIMEOUT) as resp:
             for raw in resp:
@@ -492,8 +493,34 @@ def run_turn_hermes(message, session_key, out):
                 if payload == "[DONE]":
                     break
                 try:
-                    delta = json.loads(payload)["choices"][0].get("delta", {})
-                except (json.JSONDecodeError, KeyError, IndexError):
+                    frame = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                # Hermes reports tool activity as extra top-level fields on
+                # otherwise ordinary chunks -- tool/label/status/toolCallId --
+                # rather than inside the delta. Reading only delta.content threw
+                # all of it away, which is why the main panel showed no steps
+                # while the sidebar did.
+                if frame.get("tool"):
+                    status = ("complete" if frame.get("status") == "completed"
+                              else "error" if frame.get("status") == "failed"
+                              else "in_progress")
+                    step += 1
+                    out.put(("intermediate_data: " + json.dumps({
+                        # Key on toolCallId so the running frame and its
+                        # completion collapse into one step rather than two.
+                        "id": frame.get("toolCallId") or str(step),
+                        "status": status,
+                        "name": frame.get("tool") or "tool",
+                        "payload": frame.get("label") or "",
+                        "parent_id": "default",
+                        "index": step,
+                    }) + "\n").encode())
+
+                try:
+                    delta = frame["choices"][0].get("delta", {})
+                except (KeyError, IndexError, TypeError):
                     continue
                 clean = sentinels.feed(delta.get("content") or "")
                 if clean:
