@@ -359,10 +359,12 @@ def _empty_result_diagnostics():
         info["indices"] = [i.get("index") for i in indices]
         info["indexed_documents"] = total
         info["likely_cause"] = (
-            "nothing has been ingested yet — ingest a video before searching"
+            "nothing has been ingested yet - ingest a video before searching"
             if total == 0 else
-            "documents are indexed but none matched; this deployment has a known "
-            "retrieval issue where valid queries return zero hits"
+            "content is indexed but nothing matched this query semantically. "
+            "The archive may simply not contain what was asked for. Consider "
+            "rewording, or check what the registered sources actually show "
+            "before concluding the search is broken."
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must never fail the call
         info["index_check_failed"] = f"{type(exc).__name__}: {exc}"
@@ -428,6 +430,11 @@ def run_search(body):
     # "you called it wrong", and an agent given that will retry with different
     # parameters indefinitely -- observed doing 66 tool calls and never
     # answering. Say what is actually known so it can stop.
+    #
+    # Note the diagnostics must not assert that retrieval is broken. Searching
+    # for warehouses against a clip of a tree returns nothing because that is
+    # the correct answer; claiming a known defect there sends the agent (and
+    # the reader) chasing an imaginary bug.
     if isinstance(payload, dict) and not payload.get("data"):
         payload["diagnostics"] = _empty_result_diagnostics()
     return 200, payload

@@ -1,8 +1,8 @@
 # VSS ⇄ BYO Agent — Decisions & Context
 
 **Status:** POC wired and working end to end. Chat, streaming, tool progress, skill
-discovery and archive-search plumbing all verified; archive *retrieval* is blocked on an
-open VSS issue (2.8e).
+discovery and archive search all verified, including search returning real hits. An
+earlier claim in this document that retrieval was broken was wrong; see 2.8e.
 **Date:** 2026-08-19, updated 2026-08-20
 **Reference environment:** Brev/OCI instance, 4x L40S, VSS `search` profile.
 
@@ -291,19 +291,40 @@ holds 4 docs with real 768-dim vectors at `llm.visionEmbeddings[0].vector`, mapp
 `dense_vector`. Index model (`cosmos-embed1-448p-anomaly-detection`) matches the model
 rt-embed serves.
 
-**But every search returns `{"data": [], "search_messages": []}`** — zero hits, no
-diagnostic — including with `--min-cosine-similarity 0.0`, an explicit `--video-source`,
-explicit `--source-type`, and explicit time bounds covering the indexed window. The CLI
-has the right index recorded in `~/.vss/config.json`.
+**CORRECTION — there was never a retrieval bug. Search works.**
 
-Unresolved: where the *query-side* text embedding comes from. `rt-embed`'s OpenAPI
-exposes only files/metrics/health paths — no text-embedding route — and `/v1/embeddings`
-and `/v1/embed` both 404. Indexing is a video-embedding path; the query path is not
-obviously served by the same component.
+For a long stretch of this work every search returned `{"data": [], "search_messages":
+[]}`, and that was recorded here as an unresolved VSS retrieval defect, repeated across
+several commits. It was wrong, and the error was mine.
 
-This is a VSS retrieval issue, not an adapter one: `/v1/search` faithfully returns
-whatever the CLI produces. Worth noting that the empty `search_messages` makes this
-silent — a caller cannot distinguish "no matches" from "retrieval is misconfigured".
+The ingested clip is `data/videos/dev-profile-alerts/warehouse_01.mp4` — whose **content
+is a tree**, despite the filename. Every query used to test it ("person in a warehouse",
+"a person wearing a hard hat", "warehouse") described things that are genuinely not in
+the video, so zero hits was the correct answer throughout.
+
+Querying for what is actually there works immediately:
+
+| query | hits |
+|---|---|
+| `tree` | 1 (similarity 0.27) |
+| `a tree` | 1 |
+| `outdoor scene` | 1 |
+| `person` | 0 |
+
+What made this stick for so long: `--min-cosine-similarity 0.0` still returned nothing,
+which read as "not even the loosest match survives, so retrieval must be broken". In fact
+other filters (top-percent, embed-confidence) still apply, so a zero threshold does not
+mean "return anything". That reasoning was plausible and wrong, and nothing checked it
+against what the video actually showed.
+
+The lesson worth keeping: **verify the fixture before diagnosing the system.** A
+misleading filename in test data was enough to manufacture a phantom bug and carry it
+through many commits.
+
+What does survive from the original complaint: an empty `search_messages` is genuinely
+unhelpful. It gave no way to tell "nothing matched" from "misconfigured", which is what
+allowed a wrong conclusion to look reasonable — and what sent an agent into a 66-call
+retry loop (2.8g).
 
 **Also found and fixed:** `vss-agent` was handing out upload URLs built from a stale
 `VSS_AGENT_EXTERNAL_URL` pointing at a dead cloudflare hostname, so the documented
@@ -705,10 +726,12 @@ Deliberately not committed: `deploy/docker/resolved.yml` (generated, gitignored)
    only assigns `NVIDIA_API_KEY` and `NEMOCLAW_MODEL`. Since cell 12 derives
    `NEMOCLAW_PROVIDER = "custom" if NEMOCLAW_ENDPOINT_URL else "build"`, running cell 6 or 8
    first in the same kernel silently onboards against a stale endpoint.
-5. **Archive search fails silently.** Zero hits and an empty `search_messages` are
-   indistinguishable from "retrieval is misconfigured" (2.8e). A caller — human or agent —
-   cannot tell the difference, and an agent will confabulate a reason. The CLI should say
-   why it found nothing.
+5. **Archive search reports nothing when it finds nothing.** An empty
+   `search_messages` alongside `data: []` gives a caller no way to tell "no semantic
+   match" from "misconfigured" (2.8e). This is a real usability defect even though the
+   retrieval itself works: it let a wrong diagnosis stand for a long time, and it sent an
+   agent into a 66-call retry loop before it would answer (2.8g). The CLI should state
+   what it searched and why nothing matched.
 6. **Skill requirements are undeclared.** Requirements have to be guessed by grepping
    `SKILL.md` prose (2.8c). A `requirements:` block in the frontmatter would make this
    exact instead of heuristic, and would let any host check runnability before starting.
@@ -721,12 +744,12 @@ Deliberately not committed: `deploy/docker/resolved.yml` (generated, gitignored)
 
 ## 8. Next steps
 
-1. **Unblock retrieval** (2.8e). Everything else about search now works: ingestion,
-   indexing with real vectors, the CLI, the HTTP endpoint, and the agent reaching it. The
-   query-side embedding path is the one broken link, and the artifact/rendering work below
-   is gated on it — there is nothing to render until search returns hits.
-2. Then: delete `agentResponseParser.ts`'s full-payload parsing and shrink it to the
-   `vss_artifact` reference marker; update `vss-search-archive` to emit it.
+1. **Artifact rendering is now unblocked** — search returns real hits (2.8e), so there
+   is finally something to render. Delete `agentResponseParser.ts`'s full-payload parsing,
+   shrink it to the `vss_artifact` reference marker, and update `vss-search-archive` to
+   emit it.
+2. Ingest a clip whose content matches what you intend to demo, and check what it shows
+   before writing queries against it.
 3. **Decide multi-user isolation (2.10) before more UI work.** Still the item most likely
    to force a rewrite if deferred.
 4. Write the contract spec as a reviewable doc so a BYO integrator has something to build
